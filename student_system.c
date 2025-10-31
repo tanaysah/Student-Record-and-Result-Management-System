@@ -17,10 +17,13 @@
 #ifdef _WIN32
   #include <direct.h>
   #define MKDIR(dir) _mkdir(dir)
+  #include <io.h>
+  #define isatty _isatty
 #else
   #include <sys/stat.h>
   #include <sys/types.h>
   #define MKDIR(dir) mkdir(dir, 0755)
+  #include <unistd.h>
 #endif
 
 #define DATA_FILE "students.dat"
@@ -305,8 +308,7 @@ void admin_enter_marks_and_update_cgpa() {
 
         /* Ensure reports dir exists */
         if (MKDIR(REPORTS_DIR) != 0) {
-            /* MKDIR may set errno; but ignore failure since dir may already exist.
-               On some systems MKDIR returns -1, on others 0. We don't treat it fatal. */
+            /* ignore potential error; dir may already exist */
         }
         generate_html_report(idx, college, semester, exam);
         printf("If successful, report is at '%s/%d_result.html'\n", REPORTS_DIR, s->id);
@@ -314,7 +316,6 @@ void admin_enter_marks_and_update_cgpa() {
         printf("Skipping report generation.\n");
     }
 }
-
 
 /* For students: view SGPA (calculated from stored marks) without updating CGPA */
 void student_view_sgpa_and_cgpa(int idx) {
@@ -849,14 +850,13 @@ void generate_html_report(int idx, const char* college, const char* semester, co
     char path[512];
     snprintf(path, sizeof(path), "%s/%d_result.html", REPORTS_DIR, s->id);
 
-        FILE *f = fopen(path, "w");
+    FILE *f = fopen(path, "w");
     if (!f) {
         perror("Unable to create report file");
         printf("Tried to write report to: %s\n", path);
         printf("Hint: Check if the 'reports' folder exists and you have write permissions.\n");
         return;
     }
-
 
     // current date
     time_t t = time(NULL);
@@ -1046,7 +1046,27 @@ void main_menu() {
     }
 }
 
-int main() {
+/* ----- New main with demo mode + non-interactive guard ----- */
+
+int main(int argc, char **argv) {
+    /* Demo mode: quick non-interactive sample output for hosting / previews */
+    if (argc > 1 && strcmp(argv[1], "--demo") == 0) {
+        printf("Demo Mode: Student Management System\n");
+        printf("1) Add Student: ID=1001, Name=Tanay Sah, Year=1, Dept=CS\n");
+        printf("2) Add Student: ID=1002, Name=Riya Sharma, Year=1, Dept=CS\n");
+        printf("3) Total students (sample): 2\n");
+        printf("Commands available in interactive mode: add, edit, delete, attendance, marks, report\n");
+        return 0;
+    }
+
+    /* If running non-interactively (no TTY), exit with a short message.
+       This prevents the program from looping waiting for stdin when hosted. */
+    if (!isatty(fileno(stdin))) {
+        fprintf(stderr, "Non-interactive environment detected. Run with --demo for demo output.\n");
+        return 1;
+    }
+
+    /* Normal interactive startup */
     // Ensure reports dir exists so students see message path even if empty
     MKDIR(REPORTS_DIR);
 
@@ -1057,4 +1077,3 @@ int main() {
     main_menu();
     return 0;
 }
-
