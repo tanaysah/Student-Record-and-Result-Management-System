@@ -11,6 +11,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>      // for strcasecmp, strcasestr
 #include <ctype.h>
 #include <unistd.h>
 #include <errno.h>
@@ -22,9 +23,11 @@
 #include <fcntl.h>
 #include <limits.h>
 #include <time.h>
+#include <dirent.h>       // for DIR, struct dirent
+#include <stddef.h>
 
 /* --- Forward declarations of functions from student_system.c --- */
-/* Make sure these functions exist in your student_system.c file (they do in your current program). */
+/* Make sure these functions exist in your student_system.c file */
 extern void load_data(void);
 extern void save_data(void);
 extern void generate_html_report(int idx, const char* college, const char* semester, const char* exam);
@@ -59,8 +62,6 @@ typedef struct {
     double cgpa;
     int total_credits_completed;
 } Student;
-
-/* We'll call add_student_custom by passing a Student* cast to void*. Ensure signature matches above in your file. */
 
 /* Helper: URL-decode (form values) */
 static void urldecode_inplace(char *s) {
@@ -187,7 +188,7 @@ static void serve_report_file(int client, const char *filename) {
 }
 
 /* Read request into buffer (simple, not streaming) */
-#define REQBUF 100000
+#define REQBUF 200000
 static int read_request(int client, char *buf, int bufsz) {
     int total=0;
     int r;
@@ -230,226 +231,8 @@ static char *get_query_value(const char *reqline, const char *key) {
     return val;
 }
 
-/* Main request handler */
-static void handle_client(int client) {
-    char req[REQBUF];
-    int r = read_request(client, req, sizeof(req));
-    if (r <= 0) { close(client); return; }
-
-    /* parse request line */
-    char method[8], path[1024], protocol[32];
-    sscanf(req, "%7s %1023s %31s", method, path, protocol);
-
-    /* route: GET /  GET /list  GET /view?id=  GET /reports/<file>
-              POST /add  POST /enter-marks  POST /generate */
-    if (strcmp(method, "GET") == 0) {
-        if (strncmp(path, "/reports/", 9) == 0) {
-            char *fname = path + 9;
-            /* skip leading slash if any */
-            while (*fname == '/') fname++;
-            serve_report_file(client, fname);
-            close(client);
-            return;
-        } else if (strcmp(path, "/") == 0) {
-            load_data();
-            /* run demo mode to show sample output: call your binary with --demo to reuse behavior */
-            /* We'll try to call the compiled binary (if exists) to run --demo for sample output. */
-            char demo_out[4096] = "(demo not available)";
-            if (access("./student_system", X_OK) == 0) {
-                FILE *p = popen("./student_system --demo 2>&1", "r");
-                if (p) {
-                    size_t got = fread(demo_out,1,sizeof(demo_out)-1,p);
-                    demo_out[got]=0;
-                    pclose(p);
-                }
-            }
-            /* list reports */
-            char *reports[256]; int rc=0;
-            DIR *d = opendir("reports");
-            if (d) {
-                struct dirent *ent;
-                while ((ent = readdir(d)) && rc < 256) {
-                    if (ent->d_type == DT_REG) {
-                        size_t L = strlen(ent->d_name);
-                        if (L > 5 && strcasecmp(ent->d_name + L - 5, ".html") == 0) {
-                            reports[rc++] = strdup(ent->d_name);
-                        }
-                    }
-                }
-                closedir(d);
-            }
-            char *page = build_index_html(demo_out, reports, rc);
-            for (int i=0;i<rc;i++) free(reports[i]);
-            if (!page) send_response(client, "500 Internal Server Error", "text/plain", "Server error");
-            else {
-                send_response(client, "200 OK", "text/html; charset=utf-8", page);
-                free(page);
-            }
-            close(client);
-            return;
-        } else if (strncmp(path, "/list", 5) == 0) {
-            load_data();
-            /* We'll call the binary in CLI mode --list to get a clean pipe-delimited list if available.
-               Fallback: try to run ./student_system --list */
-            char out[8192];
-            if (access("./student_system", X_OK) == 0) {
-                FILE *p = popen("./student_system --list 2>&1", "r");
-                if (p) {
-                    size_t got = fread(out,1,sizeof(out)-1,p);
-                    out[got]=0;
-                    pclose(p);
-                } else strcpy(out, "Error running list");
-            } else strcpy(out, "Executable not found");
-            send_response(client, "200 OK", "text/html; charset=utf-8", out);
-            close(client);
-            return;
-        } else if (strncmp(path, "/view", 5) == 0) {
-            /* extract id param */
-            char *id = get_query_value(path, "id");
-            if (!id) { send_response(client, "400 Bad Request", "text/plain", "Missing id"); close(client); return; }
-            char cmd[256];
-            snprintf(cmd, sizeof(cmd), "./student_system --view %s 2>&1", id);
-            char out[8192];
-            FILE *p = popen(cmd, "r");
-            if (p) {
-                size_t got = fread(out,1,sizeof(out)-1,p);
-                out[got]=0;
-                pclose(p);
-            } else strcpy(out, "Error running view");
-            send_response(client, "200 OK", "text/html; charset=utf-8", out);
-            free(id);
-            close(client);
-            return;
-        }
-    } else if (strcmp(method, "POST") == 0) {
-        /* find body start */
-        char *body = strstr(req, "\r\n\r\n");
-        if (!body) { send_response(client, "400 Bad Request", "text/plain", "No body"); close(client); return; }
-        body += 4;
-        /* content-type assumed application/x-www-form-urlencoded */
-        if (strncmp(path, "/add", 4) == 0) {
-            /* parse form values: name, age, dept, year, num_subjects, subjects, password */
-            char *name = form_value(body, "name");
-            char *age = form_value(body, "age");
-            char *dept = form_value(body, "dept");
-            char *year = form_value(body, "year");
-            char *num_sub = form_value(body, "num_subjects");
-            char *subjects = form_value(body, "subjects");
-            char *password = form_value(body, "password");
-            if (!name || !age || !dept || !year || !num_sub || !subjects || !password) {
-                send_response(client, "400 Bad Request", "text/plain", "Missing form fields");
-                goto cleanup_add;
-            }
-            /* build Student struct */
-            Student s;
-            memset(&s, 0, sizeof(s));
-            s.exists = 1;
-            s.cgpa = 0.0; s.total_credits_completed = 0;
-            strncpy(s.name, name, sizeof(s.name)-1);
-            s.age = atoi(age);
-            strncpy(s.dept, dept, sizeof(s.dept)-1);
-            s.year = atoi(year);
-            s.num_subjects = atoi(num_sub);
-            if (s.num_subjects < 1 || s.num_subjects > MAX_SUBJECTS) s.num_subjects = MAX_SUBJECTS;
-            /* parse subjects csv */
-            char *tok = strtok(subjects, ",");
-            int si=0;
-            while (tok && si < s.num_subjects) {
-                while (*tok==' ') tok++;
-                strncpy(s.subjects[si].name, tok, sizeof(s.subjects[si].name)-1);
-                s.subjects[si].classes_attended = 0;
-                s.subjects[si].classes_held = 0;
-                s.subjects[si].marks = 0;
-                s.subjects[si].credits = 0;
-                si++; tok = strtok(NULL, ",");
-            }
-            strncpy(s.password, password, sizeof(s.password)-1);
-            /* call add_student_custom (from student_system.c) */
-            add_student_custom((void*)&s);
-            send_response(client, "200 OK", "text/html; charset=utf-8", "Student added. <p><a href='/'>Back</a></p>");
-
-        cleanup_add:
-            if (name) free(name);
-            if (age) free(age);
-            if (dept) free(dept);
-            if (year) free(year);
-            if (num_sub) free(num_sub);
-            if (subjects) free(subjects);
-            if (password) free(password);
-            close(client); return;
-        }
-
-        if (strncmp(path, "/enter-marks", 12) == 0) {
-            /* parse id and marks body param (marks may be urlencoded multiline) */
-            char *id = form_value(body, "id");
-            char *marks = form_value(body, "marks");
-            if (!id || !marks) { send_response(client, "400 Bad Request", "text/plain", "Missing id or marks"); if (id) free(id); if (marks) free(marks); close(client); return; }
-            int sid = atoi(id);
-            int idx = find_index_by_id(sid);
-            if (idx == -1) { send_response(client, "404 Not Found", "text/plain", "Student not found"); free(id); free(marks); close(client); return; }
-            /* create a temp file then call --enter-marks-file or call the function directly if available */
-            char tmpfn[PATH_MAX];
-            snprintf(tmpfn, sizeof(tmpfn), "/tmp/marks_%d_%ld.txt", getpid(), time(NULL));
-            FILE *tf = fopen(tmpfn, "w");
-            if (!tf) { send_response(client, "500 Internal", "text/plain", "Cannot create temp file"); free(id); free(marks); close(client); return; }
-            fprintf(tf, "%d\n", sid);
-            /* marks contains lines separated by newline; parse */
-            char *line = strtok(marks, "\n");
-            while (line) {
-                /* normalize commas/spaces */
-                char *clean = line;
-                while (*clean && (*clean==' ' || *clean=='\r' || *clean=='\n' || *clean=='\t')) clean++;
-                if (*clean) fprintf(tf, "%s\n", clean);
-                line = strtok(NULL, "\n");
-            }
-            fclose(tf);
-            /* call the binary with --enter-marks-file */
-            char cmd[PATH_MAX + 64];
-            snprintf(cmd, sizeof(cmd), "./student_system --enter-marks-file %s 2>&1", tmpfn);
-            FILE *p = popen(cmd, "r");
-            char out[8192]; out[0]=0;
-            if (p) {
-                size_t got = fread(out,1,sizeof(out)-1,p);
-                out[got]=0;
-                pclose(p);
-            } else strcpy(out, "Error running marks update");
-            unlink(tmpfn);
-            send_response(client, "200 OK", "text/html; charset=utf-8", out);
-            free(id); free(marks); close(client); return;
-        }
-
-        if (strncmp(path, "/generate", 9) == 0) {
-            char *id = form_value(body, "id");
-            char *college = form_value(body, "college");
-            char *semester = form_value(body, "semester");
-            char *exam = form_value(body, "exam");
-            if (!id) { send_response(client, "400 Bad Request", "text/plain", "Missing id"); if (college) free(college); if (semester) free(semester); if (exam) free(exam); close(client); return; }
-            int sid = atoi(id);
-            int idx = find_index_by_id(sid);
-            if (idx == -1) { send_response(client, "404 Not Found", "text/plain", "Student not found"); free(id); if (college) free(college); if (semester) free(semester); if (exam) free(exam); close(client); return; }
-            /* default strings if null */
-            char cbuf[256] = "Your College", sbuf[64] = "Semester -", eb[64] = "Exam -";
-            if (college) { strncpy(cbuf, college, sizeof(cbuf)-1); free(college); }
-            if (semester) { strncpy(sbuf, semester, sizeof(sbuf)-1); free(semester); }
-            if (exam) { strncpy(eb, exam, sizeof(eb)-1); free(exam); }
-            free(id);
-            generate_html_report(idx, cbuf, sbuf, eb);
-            char resp[256];
-            snprintf(resp, sizeof(resp), "Report generated at reports/%d_result.html", sid);
-            send_response(client, "200 OK", "text/html; charset=utf-8", resp);
-            close(client); return;
-        }
-
-        /* unsupported POST */
-        send_response(client, "404 Not Found", "text/plain", "Not found");
-        close(client);
-        return;
-    }
-
-    /* unsupported method */
-    send_response(client, "405 Method Not Allowed", "text/plain", "Method not allowed");
-    close(client);
-}
+/* Main request handler forward */
+static void handle_client(int client);
 
 /* Start listening on port from env or default 8080 */
 int main(int argc, char **argv) {
@@ -504,4 +287,204 @@ int main(int argc, char **argv) {
 
     close(server_fd);
     return 0;
+}
+
+/* Main request handler implementation */
+static void handle_client(int client) {
+    char req[REQBUF];
+    int r = read_request(client, req, sizeof(req));
+    if (r <= 0) { close(client); return; }
+
+    /* parse request line */
+    char method[8], path[1024], protocol[32];
+    sscanf(req, "%7s %1023s %31s", method, path, protocol);
+
+    if (strcmp(method, "GET") == 0) {
+        if (strncmp(path, "/reports/", 9) == 0) {
+            char *fname = path + 9;
+            while (*fname == '/') fname++;
+            serve_report_file(client, fname);
+            close(client);
+            return;
+        } else if (strcmp(path, "/") == 0) {
+            load_data();
+            /* run demo mode to show sample output: call compiled binary if available */
+            char demo_out[4096] = "(demo not available)";
+            if (access("./student_system", X_OK) == 0) {
+                FILE *p = popen("./student_system --demo 2>&1", "r");
+                if (p) {
+                    size_t got = fread(demo_out,1,sizeof(demo_out)-1,p);
+                    demo_out[got]=0;
+                    pclose(p);
+                }
+            }
+            /* list reports */
+            char *reports[256]; int rc=0;
+            DIR *d = opendir("reports");
+            if (d) {
+                struct dirent *ent;
+                while ((ent = readdir(d)) && rc < 256) {
+                    if (ent->d_type == DT_REG || ent->d_type == DT_UNKNOWN) {
+                        size_t L = strlen(ent->d_name);
+                        if (L > 5 && strcasecmp(ent->d_name + L - 5, ".html") == 0) {
+                            reports[rc++] = strdup(ent->d_name);
+                        }
+                    }
+                }
+                closedir(d);
+            }
+            char *page = build_index_html(demo_out, reports, rc);
+            for (int i=0;i<rc;i++) free(reports[i]);
+            if (!page) send_response(client, "500 Internal Server Error", "text/plain", "Server error");
+            else {
+                send_response(client, "200 OK", "text/html; charset=utf-8", page);
+                free(page);
+            }
+            close(client);
+            return;
+        } else if (strncmp(path, "/list", 5) == 0) {
+            load_data();
+            char out[8192];
+            if (access("./student_system", X_OK) == 0) {
+                FILE *p = popen("./student_system --list 2>&1", "r");
+                if (p) {
+                    size_t got = fread(out,1,sizeof(out)-1,p);
+                    out[got]=0;
+                    pclose(p);
+                } else strcpy(out, "Error running list");
+            } else strcpy(out, "Executable not found");
+            send_response(client, "200 OK", "text/html; charset=utf-8", out);
+            close(client);
+            return;
+        } else if (strncmp(path, "/view", 5) == 0) {
+            char *id = get_query_value(path, "id");
+            if (!id) { send_response(client, "400 Bad Request", "text/plain", "Missing id"); close(client); return; }
+            char cmd[256];
+            snprintf(cmd, sizeof(cmd), "./student_system --view %s 2>&1", id);
+            char out[8192];
+            FILE *p = popen(cmd, "r");
+            if (p) {
+                size_t got = fread(out,1,sizeof(out)-1,p);
+                out[got]=0;
+                pclose(p);
+            } else strcpy(out, "Error running view");
+            send_response(client, "200 OK", "text/html; charset=utf-8", out);
+            free(id);
+            close(client);
+            return;
+        }
+    } else if (strcmp(method, "POST") == 0) {
+        char *body = strstr(req, "\r\n\r\n");
+        if (!body) { send_response(client, "400 Bad Request", "text/plain", "No body"); close(client); return; }
+        body += 4;
+        if (strncmp(path, "/add", 4) == 0) {
+            char *name = form_value(body, "name");
+            char *age = form_value(body, "age");
+            char *dept = form_value(body, "dept");
+            char *year = form_value(body, "year");
+            char *num_sub = form_value(body, "num_subjects");
+            char *subjects = form_value(body, "subjects");
+            char *password = form_value(body, "password");
+            if (!name || !age || !dept || !year || !num_sub || !subjects || !password) {
+                send_response(client, "400 Bad Request", "text/plain", "Missing form fields");
+                goto cleanup_add;
+            }
+            Student s;
+            memset(&s, 0, sizeof(s));
+            s.exists = 1;
+            s.cgpa = 0.0; s.total_credits_completed = 0;
+            strncpy(s.name, name, sizeof(s.name)-1);
+            s.age = atoi(age);
+            strncpy(s.dept, dept, sizeof(s.dept)-1);
+            s.year = atoi(year);
+            s.num_subjects = atoi(num_sub);
+            if (s.num_subjects < 1 || s.num_subjects > MAX_SUBJECTS) s.num_subjects = MAX_SUBJECTS;
+            char *subtok = strtok(subjects, ",");
+            int si=0;
+            while (subtok && si < s.num_subjects) {
+                while (*subtok == ' ') subtok++;
+                strncpy(s.subjects[si].name, subtok, sizeof(s.subjects[si].name)-1);
+                s.subjects[si].classes_attended = 0;
+                s.subjects[si].classes_held = 0;
+                s.subjects[si].marks = 0;
+                s.subjects[si].credits = 0;
+                si++; subtok = strtok(NULL, ",");
+            }
+            strncpy(s.password, password, sizeof(s.password)-1);
+            add_student_custom((void*)&s);
+            send_response(client, "200 OK", "text/html; charset=utf-8", "Student added. <p><a href='/'>Back</a></p>");
+
+        cleanup_add:
+            if (name) free(name);
+            if (age) free(age);
+            if (dept) free(dept);
+            if (year) free(year);
+            if (num_sub) free(num_sub);
+            if (subjects) free(subjects);
+            if (password) free(password);
+            close(client); return;
+        }
+
+        if (strncmp(path, "/enter-marks", 12) == 0) {
+            char *id = form_value(body, "id");
+            char *marks = form_value(body, "marks");
+            if (!id || !marks) { send_response(client, "400 Bad Request", "text/plain", "Missing id or marks"); if (id) free(id); if (marks) free(marks); close(client); return; }
+            int sid = atoi(id);
+            int idx = find_index_by_id(sid);
+            if (idx == -1) { send_response(client, "404 Not Found", "text/plain", "Student not found"); free(id); free(marks); close(client); return; }
+            char tmpfn[PATH_MAX];
+            snprintf(tmpfn, sizeof(tmpfn), "/tmp/marks_%d_%ld.txt", getpid(), time(NULL));
+            FILE *tf = fopen(tmpfn, "w");
+            if (!tf) { send_response(client, "500 Internal", "text/plain", "Cannot create temp file"); free(id); free(marks); close(client); return; }
+            fprintf(tf, "%d\n", sid);
+            char *line = strtok(marks, "\n");
+            while (line) {
+                char *clean = line;
+                while (*clean && (*clean==' ' || *clean=='\r' || *clean=='\n' || *clean=='\t')) clean++;
+                if (*clean) fprintf(tf, "%s\n", clean);
+                line = strtok(NULL, "\n");
+            }
+            fclose(tf);
+            char cmd[PATH_MAX + 64];
+            snprintf(cmd, sizeof(cmd), "./student_system --enter-marks-file %s 2>&1", tmpfn);
+            FILE *p = popen(cmd, "r");
+            char out[8192]; out[0]=0;
+            if (p) {
+                size_t got = fread(out,1,sizeof(out)-1,p);
+                out[got]=0;
+                pclose(p);
+            } else strcpy(out, "Error running marks update");
+            unlink(tmpfn);
+            send_response(client, "200 OK", "text/html; charset=utf-8", out);
+            free(id); free(marks); close(client); return;
+        }
+
+        if (strncmp(path, "/generate", 9) == 0) {
+            char *id = form_value(body, "id");
+            char *college = form_value(body, "college");
+            char *semester = form_value(body, "semester");
+            char *exam = form_value(body, "exam");
+            if (!id) { send_response(client, "400 Bad Request", "text/plain", "Missing id"); if (college) free(college); if (semester) free(semester); if (exam) free(exam); close(client); return; }
+            int sid = atoi(id);
+            int idx = find_index_by_id(sid);
+            if (idx == -1) { send_response(client, "404 Not Found", "text/plain", "Student not found"); free(id); if (college) free(college); if (semester) free(semester); if (exam) free(exam); close(client); return; }
+            char cbuf[256] = "Your College", sbuf[64] = "Semester -", eb[64] = "Exam -";
+            if (college) { strncpy(cbuf, college, sizeof(cbuf)-1); free(college); }
+            if (semester) { strncpy(sbuf, semester, sizeof(sbuf)-1); free(semester); }
+            if (exam) { strncpy(eb, exam, sizeof(eb)-1); free(exam); }
+            free(id);
+            generate_html_report(idx, cbuf, sbuf, eb);
+            char resp[256];
+            snprintf(resp, sizeof(resp), "Report generated at reports/%d_result.html", sid);
+            send_response(client, "200 OK", "text/html; charset=utf-8", resp);
+            close(client); return;
+        }
+
+        send_response(client, "404 Not Found", "text/plain", "Not found");
+        close(client);
+        return;
+    }
+
+    send_response(client, "405 Method Not Allowed", "text/plain", "Method not allowed");
+    close(client);
 }
