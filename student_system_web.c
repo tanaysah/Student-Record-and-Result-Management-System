@@ -1,5 +1,4 @@
-/*
- student_system_web.c
+/* student_system_web.c
  Minimal pure-C HTTP wrapper for student_system.c
  Compile together with student_system.c:
    gcc -DBUILD_WEB student_system.c student_system_web.c -o student_system_web
@@ -290,8 +289,6 @@ static char *build_view_text(int idx) {
         off += snprintf(buf + off, 8192 - off, " %d) %s - Attended %d/%d (%.2f%%) | Marks: %d | Credits: %d\n",
                         i+1, s->subjects[i].name, att, held, pct, s->subjects[i].marks, s->subjects[i].credits);
     }
-    double sgpa = 0.0;
-    /* We can't call calculate_sgpa_for_student here (not declared), but sgpa not necessary; show stored cgpa */
     off += snprintf(buf + off, 8192 - off, "\nStored CGPA: %.3f (Credits: %d)\n", s->cgpa, s->total_credits_completed);
     off += snprintf(buf + off, 8192 - off, "</pre><p><a href='/'>Back</a></p></body></html>");
     return buf;
@@ -364,8 +361,6 @@ static void handle_client(int client) {
             }
             Student s; memset(&s, 0, sizeof(s));
             s.exists = 1; s.cgpa = 0.0; s.total_credits_completed = 0;
-            safe_strncpy:
-            ; /* label shim not used here; keep compile happy */
             /* fill */
             strncpy(s.name, name, sizeof(s.name)-1);
             s.age = atoi(age);
