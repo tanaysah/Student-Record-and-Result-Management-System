@@ -116,6 +116,8 @@ static char *form_value(const char *body, const char *key) {
     return NULL;
 }
 
+S
+
 /* Build small index HTML */
 static char *build_index_html(void) {
     ensure_reports_dir();
@@ -492,3 +494,4 @@ int main(int argc, char **argv) {
     close(server_fd);
     return 0;
 }
+
