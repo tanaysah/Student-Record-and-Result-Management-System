@@ -1046,6 +1046,30 @@ void main_menu() {
     }
 }
 
+/* --- Web API glue (add to student_system.c) --- */
+/* Make sure these are placed after the functions they call (e.g., add_student_custom, find_index_by_id, generate_html_report, calculate_and_update_cgpa_for_student etc.) */
+
+int api_find_index_by_id(int id) {
+    return find_index_by_id(id);
+}
+
+int api_add_student(Student *s) {
+    if (!s) return -1;
+    add_student_custom(s);
+    return s->id;
+}
+
+/* Generate HTML report for index (calls your generate_html_report) */
+void api_generate_report(int idx, const char* college, const char* semester, const char* exam) {
+    generate_html_report(idx, college ? college : "Your College", semester ? semester : "Semester -", exam ? exam : "Exam -");
+}
+
+/* Update CGPA for student index using stored marks (calls your function) */
+int api_calculate_update_cgpa(int idx) {
+    calculate_and_update_cgpa_for_student(idx);
+    return 0;
+}
+
 /* ----- New main with demo mode + non-interactive guard ----- */
 
 int main(int argc, char **argv) {
@@ -1077,3 +1101,4 @@ int main(int argc, char **argv) {
     main_menu();
     return 0;
 }
+
