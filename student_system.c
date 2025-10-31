@@ -63,12 +63,12 @@ typedef struct {
     int total_credits_completed;
 } Student;
 
-/* Global in-memory storage */
-static Student students[MAX_STUDENTS];
-static int student_count = 0;
+/* Global in-memory storage (non-static so web wrapper can link) */
+Student students[MAX_STUDENTS];
+int student_count = 0;
 
 /* ---------- Utility ---------- */
-static void safe_strncpy(char *dst, const char *src, size_t n) {
+void safe_strncpy(char *dst, const char *src, size_t n) {
     if (!dst) return;
     if (!src) { dst[0] = '\0'; return; }
     strncpy(dst, src, n-1);
@@ -106,7 +106,7 @@ void load_data(void) {
     }
     if (student_count < 0 || student_count > MAX_STUDENTS) student_count = 0;
     if (fread(students, sizeof(Student), student_count, fp) < (size_t)student_count) {
-        /* truncated file — tolerate */
+        /* tolerate truncated file */
     }
     fclose(fp);
 }
@@ -455,7 +455,7 @@ void search_student(void) {
     } else printf("Invalid option.\n");
 }
 
-/* Attendance functions kept similar to previous implementation (omitted here for brevity) */
+/* Attendance functions */
 void mark_attendance_for_class(void) {
     printf("Enter exact subject name to mark (case-sensitive): ");
     char sname[MAX_SUB_NAME]; fgets(sname, sizeof(sname), stdin); sname[strcspn(sname, "\n")] = 0;
@@ -538,6 +538,9 @@ void student_view_sgpa_and_cgpa(int idx) {
     FILE *f = fopen(path, "r"); if (f) { fclose(f); printf("Printable result: %s\n", path); } else printf("No printable result yet.\n");
 }
 
+/* Forward declare interactive admin marks helper used in admin_menu */
+void admin_enter_marks_and_update_cgpa(void);
+
 /* Menus & auth */
 int admin_menu(void) {
     while (1) {
@@ -554,7 +557,6 @@ int admin_menu(void) {
             case 8: increment_classes_held_only(); break;
             case 9: attendance_report_subject(); break;
             case 10: {
-                /* reuse admin_enter_marks_and_update_cgpa behavior */
                 admin_enter_marks_and_update_cgpa();
                 break;
             }
@@ -720,6 +722,44 @@ int api_find_index_by_id(int id) { return find_index_by_id(id); }
 int api_add_student(Student *s) { if (!s) return -1; if (s->id == 0) s->id = generate_unique_id(); add_student_custom(s); return s->id; }
 void api_generate_report(int idx, const char* college, const char* semester, const char* exam) { generate_html_report(idx, college, semester, exam); }
 int api_calculate_update_cgpa(int idx) { calculate_and_update_cgpa_for_student(idx); return 0; }
+
+/* ---------- new: interactive admin marks handler (was missing) ---------- */
+
+/* Interactive admin function to enter marks for a student and update CGPA + generate report */
+void admin_enter_marks_and_update_cgpa(void) {
+    int id;
+    printf("Enter student ID to enter marks for: ");
+    while (scanf("%d", &id) != 1) { clear_stdin(); printf("Invalid. Enter student ID: "); }
+    clear_stdin();
+    int idx = find_index_by_id(id);
+    if (idx == -1) { printf("Student not found.\n"); return; }
+    Student *s = &students[idx];
+    if (s->num_subjects <= 0) { printf("Student has no subjects defined.\n"); return; }
+
+    printf("Entering marks for %s (ID: %d). Enter marks and credits for each subject.\n", s->name, s->id);
+    for (int i = 0; i < s->num_subjects; ++i) {
+        int mk = -1, cr = -1;
+        printf("Subject %d) %s\n", i+1, s->subjects[i].name);
+        printf("  Enter marks (0-100): ");
+        while (scanf("%d", &mk) != 1 || mk < 0 || mk > 100) { clear_stdin(); printf("Invalid. Enter marks (0-100): "); }
+        clear_stdin();
+        printf("  Enter credits (positive integer): ");
+        while (scanf("%d", &cr) != 1 || cr <= 0) { clear_stdin(); printf("Invalid. Enter credits (positive integer): "); }
+        clear_stdin();
+        s->subjects[i].marks = mk;
+        s->subjects[i].credits = cr;
+    }
+
+    /* Recalculate CGPA and save */
+    calculate_and_update_cgpa_for_student(idx);
+
+    /* Optionally generate report immediately */
+    MKDIR(REPORTS_DIR);
+    generate_html_report(idx, NULL, NULL, NULL);
+
+    save_data();
+    printf("Marks entered and CGPA updated for ID %d. Report generated (if possible).\n", id);
+}
 
 /* ---------- main (interactive) ---------- */
 
