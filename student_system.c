@@ -307,6 +307,29 @@ void print_student_full(Student *s) {
 
 void add_student_custom(Student *s) {
     if (!s) return;
+    /* If an explicit non-zero id is provided, reject if duplicate */
+    if (s->id != 0) {
+        if (find_index_by_id(s->id) != -1) {
+            printf("Student with ID %d already exists. Aborting add.\n", s->id);
+            return;
+        }
+    }
+    int idx = next_free_spot();
+    if (idx == -1) { printf("Maximum students reached.\n"); return; }
+    if (s->id == 0) s->id = generate_unique_id();
+    students[idx] = *s;
+    save_data();
+    printf("Student added successfully. ID: %d\n", s->id);
+}
+void add_student_custom(Student *s) {
+    if (!s) return;
+    /* If an explicit non-zero id is provided, reject if duplicate */
+    if (s->id != 0) {
+        if (find_index_by_id(s->id) != -1) {
+            printf("Student with ID %d already exists. Aborting add.\n", s->id);
+            return;
+        }
+    }
     int idx = next_free_spot();
     if (idx == -1) { printf("Maximum students reached.\n"); return; }
     if (s->id == 0) s->id = generate_unique_id();
@@ -803,4 +826,5 @@ int main(int argc, char **argv) {
     return 0;
 }
 #endif /* BUILD_WEB */
+
 
