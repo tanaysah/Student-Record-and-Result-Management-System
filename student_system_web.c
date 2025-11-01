@@ -498,51 +498,59 @@ static void handle_client(int client) {
         }
 
         /* STUDENT SIGNUP - reuse existing add-file style but from form */
-        if (strncmp(path, "/student-signup", 16) == 0) {
+              if (strncmp(path, "/student-signup", 16) == 0) {
             char *name = form_value(body, "name");
             char *age = form_value(body, "age");
-            char *dept = form_value(body, "dept");
-            char *year = form_value(body, "year");
-            char *num_sub = form_value(body, "num_subjects");
-            char *subjects = form_value(body, "subjects");
+            char *sap = form_value(body, "sap_id");
             char *password = form_value(body, "password");
-            if (!name || !age || !dept || !year || !num_sub || !subjects || !password) {
+            if (!name || !age || !sap || !password) {
                 send_text(client, "400 Bad Request", "text/plain", "Missing fields");
                 goto signup_cleanup;
             }
+
+            /* Validate sap numeric-ish (optional) and convert */
+            int sapid = atoi(sap);
+            if (sapid <= 0) {
+                /* respond with friendly message */
+                char resp[256];
+                snprintf(resp, sizeof(resp), "<!doctype html><html><body><p>Invalid SAP ID provided. Use numeric SAP ID (e.g. 590012345).</p><p><a href='/'>Back</a></p></body></html>");
+                send_text(client, "400 Bad Request", "text/html; charset=utf-8", resp);
+                goto signup_cleanup;
+            }
+
             Student s; memset(&s, 0, sizeof(s));
             s.exists = 1; s.cgpa = 0.0; s.total_credits_completed = 0;
-            strncpy(s.name, name, sizeof(s.name)-1);
+            /* basic fields only; subjects/marks empty for now */
+            safe_strncpy(s.name, name, sizeof(s.name));
             s.age = atoi(age);
-            strncpy(s.dept, dept, sizeof(s.dept)-1);
-            s.year = atoi(year);
-            s.num_subjects = atoi(num_sub);
-            if (s.num_subjects < 1 || s.num_subjects > MAX_SUBJECTS) s.num_subjects = MAX_SUBJECTS;
-            char *tmp = strdup(subjects);
-            char *tok = strtok(tmp, ",");
-            int si = 0;
-            while (tok && si < s.num_subjects) {
-                while (*tok == ' ') tok++;
-                strncpy(s.subjects[si].name, tok, sizeof(s.subjects[si].name)-1);
-                s.subjects[si].classes_held = s.subjects[si].classes_attended = s.subjects[si].marks = s.subjects[si].credits = 0;
-                si++; tok = strtok(NULL, ",");
+            safe_strncpy(s.dept, "Not set", sizeof(s.dept)); /* optional placeholder */
+            s.year = 0;
+            s.num_subjects = 0;
+            s.id = sapid; /* Important: use supplied SAP ID as student id */
+            safe_strncpy(s.password, password, sizeof(s.password));
+
+            /* Call API to add student; returns -2 if duplicate */
+            int addres = api_add_student(&s);
+            if (addres == -2) {
+                char resp[256];
+                snprintf(resp, sizeof(resp), "<!doctype html><html><body><p>SAP ID %d already registered. Try signing in.</p><p><a href='/'>Back</a></p></body></html>", s.id);
+                send_text(client, "409 Conflict", "text/html; charset=utf-8", resp);
+            } else if (addres <= 0) {
+                send_text(client, "500 Internal Server Error", "text/plain", "Unable to register");
+            } else {
+                char resp[256];
+                snprintf(resp, sizeof(resp), "<!doctype html><html><body><p>Registration successful. Your Student ID (SAP ID): <strong>%d</strong></p><p><a href='/'>Back to home</a></p></body></html>", addres);
+                send_text(client, "200 OK", "text/html; charset=utf-8", resp);
             }
-            free(tmp);
-            strncpy(s.password, password, sizeof(s.password)-1);
-            int newid = api_add_student(&s);
-            char resp[512];
-            snprintf(resp, sizeof(resp), "<!doctype html><html><body><p>Registration successful. Your Student ID: <strong>%d</strong></p><p><a href='/'>Back to home</a></p></body></html>", newid);
-            send_text(client, "200 OK", "text/html; charset=utf-8", resp);
+
         signup_cleanup:
             if (name) free(name);
             if (age) free(age);
-            if (dept) free(dept);
-            if (year) free(year);
-            if (num_sub) free(num_sub);
-            if (subjects) free(subjects);
+            if (sap) free(sap);
             if (password) free(password);
             close(client); return;
         }
+
 
         /* ADD student (admin / form) - reuses earlier /add logic used previously */
         if (strncmp(path, "/add", 4) == 0) {
@@ -688,4 +696,5 @@ int main(int argc, char **argv) {
     close(server_fd);
     return 0;
 }
+
 
