@@ -593,13 +593,17 @@ static void handle_client(int client) {
             };
             int credits[7] = {5, 2, 2, 4, 5, 2, 2};
 
-            for (int i = 0; i < 7; ++i) {
-                safe_strncpy(s.subjects[i].name, default_subjects[i], sizeof(s.subjects[i].name));
-                s.subjects[i].credits = credits[i];
-                s.subjects[i].marks = 0;
-                s.subjects[i].classes_held = 0;
-                s.subjects[i].classes_attended = 0;
-            }
+           for (int i = 0; i < 7; ++i) {
+    /* copy subject name safely and ensure null termination */
+    strncpy(s.subjects[i].name, default_subjects[i], sizeof(s.subjects[i].name) - 1);
+    s.subjects[i].name[sizeof(s.subjects[i].name) - 1] = '\0';
+
+    s.subjects[i].credits = credits[i];
+    s.subjects[i].marks = 0;
+    s.subjects[i].classes_held = 0;
+    s.subjects[i].classes_attended = 0;
+}
+
 
             /* Call API to add student */
             int addres = api_add_student(&s);
@@ -774,6 +778,7 @@ int main(int argc, char **argv) {
     close(server_fd);
     return 0;
 }
+
 
 
 
