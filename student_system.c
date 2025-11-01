@@ -724,7 +724,12 @@ void api_generate_report(int idx, const char* college, const char* semester, con
 int api_calculate_update_cgpa(int idx) { calculate_and_update_cgpa_for_student(idx); return 0; }
 
 /* ---------- new: interactive admin marks handler (was missing) ---------- */
-
+/* ---------- API for admin auth (used by web wrapper) ---------- */
+int api_admin_auth(const char *user, const char *pass) {
+    if (!user || !pass) return 0;
+    if (strcmp(user, ADMIN_USER) == 0 && strcmp(pass, ADMIN_PASS) == 0) return 1;
+    return 0;
+}
 /* Interactive admin function to enter marks for a student and update CGPA + generate report */
 void admin_enter_marks_and_update_cgpa(void) {
     int id;
@@ -798,3 +803,4 @@ int main(int argc, char **argv) {
     return 0;
 }
 #endif /* BUILD_WEB */
+
