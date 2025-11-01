@@ -192,18 +192,18 @@ static char *build_landing_page(void) {
         "</form>"
         "</div>";
 
-       const char *signup_card =
+          const char *signup_card =
         "<div class='card'>"
         "<h3>Student Sign Up</h3>"
-        "<p>Create a new student account (self-registration).</p>"
+        "<p>Register for Semester 1 (default subjects added automatically).</p>"
         "<form method='post' action='/student-signup'>"
-        "<input name='name' placeholder='Full name' required />"
+        "<input name='name' placeholder='Full Name' required />"
         "<input name='age' placeholder='Age' required />"
-        "<input name='sap_id' placeholder='SAP ID (use this as your login ID)' required />"
+        "<input name='sap_id' placeholder='SAP ID' required />"
         "<input name='password' placeholder='Password' type='password' required />"
-        "<div style='margin-top:8px'><button>Sign up</button></div>"
+        "<div style='margin-top:8px'><button>Sign Up</button></div>"
         "</form>"
-        "<p class='muted'>Use your SAP ID to sign in after registration.</p>"
+        "<p class='muted'>After registration, use your SAP ID to log in.</p>"
         "</div>";
 
 
@@ -498,7 +498,7 @@ static void handle_client(int client) {
         }
 
         /* STUDENT SIGNUP - reuse existing add-file style but from form */
-              if (strncmp(path, "/student-signup", 16) == 0) {
+                     if (strncmp(path, "/student-signup", 16) == 0) {
             char *name = form_value(body, "name");
             char *age = form_value(body, "age");
             char *sap = form_value(body, "sap_id");
@@ -508,10 +508,8 @@ static void handle_client(int client) {
                 goto signup_cleanup;
             }
 
-            /* Validate sap numeric-ish (optional) and convert */
             int sapid = atoi(sap);
             if (sapid <= 0) {
-                /* respond with friendly message */
                 char resp[256];
                 snprintf(resp, sizeof(resp), "<!doctype html><html><body><p>Invalid SAP ID provided. Use numeric SAP ID (e.g. 590012345).</p><p><a href='/'>Back</a></p></body></html>");
                 send_text(client, "400 Bad Request", "text/html; charset=utf-8", resp);
@@ -519,27 +517,54 @@ static void handle_client(int client) {
             }
 
             Student s; memset(&s, 0, sizeof(s));
-            s.exists = 1; s.cgpa = 0.0; s.total_credits_completed = 0;
-            /* basic fields only; subjects/marks empty for now */
+            s.exists = 1; 
+            s.cgpa = 0.0; 
+            s.total_credits_completed = 0;
             safe_strncpy(s.name, name, sizeof(s.name));
             s.age = atoi(age);
-            safe_strncpy(s.dept, "Not set", sizeof(s.dept)); /* optional placeholder */
-            s.year = 0;
-            s.num_subjects = 0;
-            s.id = sapid; /* Important: use supplied SAP ID as student id */
+            safe_strncpy(s.dept, "B.Tech CSE", sizeof(s.dept)); /* Default department */
+            s.year = 1; /* Year 1 (semester 1 default) */
+            s.num_subjects = 7;
+            s.id = sapid; 
             safe_strncpy(s.password, password, sizeof(s.password));
 
-            /* Call API to add student; returns -2 if duplicate */
+            /* Default semester 1 subjects */
+            const char *default_subjects[7] = {
+                "Programming in C",
+                "Linux Lab",
+                "Problem Solving",
+                "Advanced Engineering Mathematics - I",
+                "Physics for Computer Engineers",
+                "Managing Self",
+                "Environmental Sustainability and Climate Change"
+            };
+            int credits[7] = {5, 2, 2, 4, 5, 2, 2};
+
+            for (int i = 0; i < 7; ++i) {
+                safe_strncpy(s.subjects[i].name, default_subjects[i], sizeof(s.subjects[i].name));
+                s.subjects[i].credits = credits[i];
+                s.subjects[i].marks = 0;
+                s.subjects[i].classes_held = 0;
+                s.subjects[i].classes_attended = 0;
+            }
+
+            /* Call API to add student */
             int addres = api_add_student(&s);
             if (addres == -2) {
                 char resp[256];
-                snprintf(resp, sizeof(resp), "<!doctype html><html><body><p>SAP ID %d already registered. Try signing in.</p><p><a href='/'>Back</a></p></body></html>", s.id);
+                snprintf(resp, sizeof(resp),
+                    "<!doctype html><html><body><p>SAP ID %d already registered. Try signing in.</p><p><a href='/'>Back</a></p></body></html>",
+                    s.id);
                 send_text(client, "409 Conflict", "text/html; charset=utf-8", resp);
             } else if (addres <= 0) {
                 send_text(client, "500 Internal Server Error", "text/plain", "Unable to register");
             } else {
-                char resp[256];
-                snprintf(resp, sizeof(resp), "<!doctype html><html><body><p>Registration successful. Your Student ID (SAP ID): <strong>%d</strong></p><p><a href='/'>Back to home</a></p></body></html>", addres);
+                char resp[512];
+                snprintf(resp, sizeof(resp),
+                    "<!doctype html><html><body><p>Registration successful!</p>"
+                    "<p>Your Student ID (SAP ID): <strong>%d</strong></p>"
+                    "<p>Default Semester 1 subjects have been added automatically.</p>"
+                    "<p><a href='/'>Back to Home</a></p></body></html>", addres);
                 send_text(client, "200 OK", "text/html; charset=utf-8", resp);
             }
 
@@ -696,5 +721,6 @@ int main(int argc, char **argv) {
     close(server_fd);
     return 0;
 }
+
 
 
