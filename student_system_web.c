@@ -58,14 +58,15 @@ typedef struct {
 } Student;
 
 /* --- externs from student_system.c --- */
+/* student array & count (must be defined in student_system.c) */
 extern Student students[];
 extern int student_count;
 
+/* API wrappers (must be defined in student_system.c) */
 extern int api_find_index_by_id(int id);
 extern int api_add_student(Student *s);
 extern void api_generate_report(int idx, const char* college, const char* semester, const char* exam);
 extern int api_calculate_update_cgpa(int idx);
-extern int api_admin_auth(const char *user, const char *pass);
 
 /* filesystem helper */
 static void ensure_reports_dir(void) {
@@ -75,7 +76,7 @@ static void ensure_reports_dir(void) {
     }
 }
 
-/* small url-decode inplace */
+/* url-decode inplace */
 static void urldecode_inplace(char *s) {
     char *d = s;
     while (*s) {
@@ -117,10 +118,10 @@ static char *form_value(const char *body, const char *key) {
     return NULL;
 }
 
-/* tiny helper to escape HTML (very small subset) */
+/* minimal HTML escape helper */
 static void html_escape_buf(const char *in, char *out, size_t outcap) {
     size_t j = 0;
-    for (size_t i = 0; in[i] && j + 6 < outcap; ++i) {
+    for (size_t i = 0; in[i] && j + 7 < outcap; ++i) {
         char c = in[i];
         if (c == '&') { strcpy(out + j, "&amp;"); j += 5; }
         else if (c == '<') { strcpy(out + j, "&lt;"); j += 4; }
@@ -131,7 +132,7 @@ static void html_escape_buf(const char *in, char *out, size_t outcap) {
     out[j] = 0;
 }
 
-/* grade point helper (same logic as in student_system.c) */
+/* grade-point helper (same logic as student_system.c) */
 static int marks_to_grade_point_local(int marks) {
     if (marks >= 90) return 10;
     if (marks >= 80) return 9;
@@ -142,7 +143,7 @@ static int marks_to_grade_point_local(int marks) {
     return 0;
 }
 
-/* compute SGPA (local copy) */
+/* compute SGPA locally */
 static double compute_sgpa_local(const Student *s) {
     int total_credits = 0;
     double weighted = 0.0;
@@ -158,7 +159,7 @@ static double compute_sgpa_local(const Student *s) {
     return weighted / (double)total_credits;
 }
 
-/* Build landing page with three prominent cards + nice background */
+/* Build landing page with three cards */
 static char *build_landing_page(void) {
     ensure_reports_dir();
     const char *html_start =
@@ -166,7 +167,7 @@ static char *build_landing_page(void) {
         "<meta name='viewport' content='width=device-width,initial-scale=1'/>"
         "<style>"
         "body{margin:0;font-family:Inter,Arial,Helvetica,sans-serif;background:linear-gradient(135deg,#f0f6ff 0%,#ffffff 40%,#f7f2ff 100%);min-height:100vh;display:flex;align-items:center;justify-content:center}"
-        ".wrap{max-width:1100px;width:95%;margin:40px auto;background:rgba(255,255,255,0.9);border-radius:12px;padding:26px;box-shadow:0 8px 28px rgba(20,20,50,0.08)}"
+        ".wrap{max-width:1100px;width:95%;margin:40px auto;background:rgba(255,255,255,0.95);border-radius:12px;padding:26px;box-shadow:0 8px 28px rgba(20,20,50,0.08)}"
         "h1{margin:0;font-size:28px;color:#12263a} p.lead{color:#4b5563}"
         ".grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:16px;margin-top:18px}"
         ".card{background:#fff;border-radius:10px;padding:18px;border:1px solid rgba(20,20,60,0.04)}"
@@ -192,7 +193,7 @@ static char *build_landing_page(void) {
         "</form>"
         "</div>";
 
-          const char *signup_card =
+    const char *signup_card =
         "<div class='card'>"
         "<h3>Student Sign Up</h3>"
         "<p>Register for Semester 1 (default subjects added automatically).</p>"
@@ -205,7 +206,6 @@ static char *build_landing_page(void) {
         "</form>"
         "<p class='muted'>After registration, use your SAP ID to log in.</p>"
         "</div>";
-
 
     const char *signin_card =
         "<div class='card'>"
@@ -231,7 +231,7 @@ static char *build_landing_page(void) {
     return buf;
 }
 
-/* send text/html response */
+/* send text response helper */
 static void send_text(int client, const char *status, const char *ctype, const char *body) {
     char header[512];
     int hlen = snprintf(header, sizeof(header),
@@ -336,7 +336,7 @@ static char *build_student_dashboard(int idx) {
         snprintf(row, sizeof(row),
                  "<tr><td>%d</td><td>%s</td><td>%d</td><td>%d</td><td>%.0f</td><td>%d%%</td></tr>",
                  i+1, sname_esc, s->subjects[i].marks, s->subjects[i].credits, gp, pct);
-        strcat(subject_rows, row);
+        strncat(subject_rows, row, sizeof(subject_rows)-strlen(subject_rows)-1);
     }
     double sgpa = compute_sgpa_local(s);
     /* Build small inline SVG bar chart */
@@ -348,7 +348,7 @@ static char *build_student_dashboard(int idx) {
     snprintf(svg_start, sizeof(svg_start), "<svg viewBox='0 0 %d %d' width='%d' height='%d' xmlns='http://www.w3.org/2000/svg'><rect width='100%%' height='100%%' fill='transparent'/>", w, h, w, h);
     strcpy(svg, svg_start);
     /* axes */
-    snprintf(svg + strlen(svg), sizeof(svg)-strlen(svg), "<line x1='%d' y1='%d' x2='%d' y2='%d' stroke='#ddd'/>", pad, h-pad, w-pad, h-pad);
+    snprintf(svg + strlen(svg), sizeof(svg)-strlen(svg), "<line x1='%d' y1='%d' x2='%d' y2='%d' stroke='#eee'/>", pad, h-pad, w-pad, h-pad);
     for (int i = 0; i < maxbars; ++i) {
         int x = pad + i*(barw+8);
         int barh = (percentages[i] * (h - pad*2)) / 100;
@@ -356,10 +356,12 @@ static char *build_student_dashboard(int idx) {
         snprintf(svg + strlen(svg), sizeof(svg)-strlen(svg),
                  "<rect x='%d' y='%d' width='%d' height='%d' rx='4' ry='4' fill='#3b82f6' opacity='0.85'/>",
                  x, y, barw, barh);
-        /* label */
-        char lbl[128]; html_escape_buf(s->subjects[i].name, lbl, sizeof(lbl));
+        /* label (short) */
+        char lbl[64]; html_escape_buf(s->subjects[i].name, lbl, sizeof(lbl));
+        /* trim label if too long */
+        if (strlen(lbl) > 18) lbl[18] = '\0';
         snprintf(svg + strlen(svg), sizeof(svg)-strlen(svg),
-                 "<text x='%d' y='%d' font-size='10' fill='#111' transform='translate(0,14) rotate(0)' >%s</text>",
+                 "<text x='%d' y='%d' font-size='10' fill='#111'>%s</text>",
                  x, h-pad+12, lbl);
     }
     strcat(svg, "</svg>");
@@ -378,10 +380,11 @@ static char *build_student_dashboard(int idx) {
     if (!buf) return NULL;
     strcpy(buf, tpl_start);
     char header[512];
+    char dept_esc[256]; html_escape_buf(s->dept, dept_esc, sizeof(dept_esc));
     snprintf(header, sizeof(header),
              "<h2>Welcome, %s</h2><p>ID: %d | Dept: %s | Year: %d | Age: %d</p>"
              "<p><strong>SGPA (current):</strong> %.3f  &nbsp;&nbsp; <strong>Stored CGPA:</strong> %.3f (Credits: %d)</p>",
-             escaped_name, s->id, s->dept, s->year, s->age, sgpa, s->cgpa, s->total_credits_completed);
+             escaped_name, s->id, dept_esc, s->year, s->age, sgpa, s->cgpa, s->total_credits_completed);
     strcat(buf, header);
     strcat(buf, "<h3>Attendance (per subject)</h3>");
     strcat(buf, svg);
@@ -401,7 +404,7 @@ static void handle_client(int client) {
     char method[8] = {0}, path[1024] = {0}, proto[32] = {0};
     sscanf(req, "%7s %1023s %31s", method, path, proto);
 
-    /* route: GET /reports/<name> */
+    /* GET routes */
     if (strcmp(method, "GET") == 0) {
         if (strncmp(path, "/reports/", 9) == 0) {
             const char *fname = path + 9;
@@ -430,7 +433,7 @@ static void handle_client(int client) {
                 char *v = form_value(qs, "id");
                 char *p = form_value(qs, "pass");
                 if (v) { id = atoi(v); free(v); }
-                if (p) { strncpy(pass, p, sizeof(pass)-1); free(p); }
+                if (p) { strncpy(pass, p, sizeof(pass)-1); pass[sizeof(pass)-1] = '\0'; free(p); }
                 free(qs);
             }
             if (id <= 0 || pass[0]==0) {
@@ -445,13 +448,15 @@ static void handle_client(int client) {
             else { send_text(client, "200 OK", "text/html; charset=utf-8", page); free(page); }
             close(client); return;
         }
-    } else if (strcmp(method, "POST") == 0) {
-        /* find body */
+    }
+
+    /* POST routes */
+    if (strcmp(method, "POST") == 0) {
         char *body = strstr(req, "\r\n\r\n");
         if (!body) { send_text(client, "400 Bad Request", "text/plain", "No body"); close(client); return; }
         body += 4;
 
-        /* ADMIN LOGIN (returns admin dashboard page with forms for admin actions) */
+        /* --- Admin login (demo check admin/admin) --- */
         if (strncmp(path, "/admin-login", 12) == 0) {
             char *user = form_value(body, "username");
             char *pass = form_value(body, "password");
@@ -460,15 +465,16 @@ static void handle_client(int client) {
                 if (user) free(user); if (pass) free(pass);
                 close(client); return;
             }
-            int ok = api_admin_auth(user, pass);
+            /* Demo admin check: change this if you integrate a proper api_admin_auth */
+            int ok = (strcmp(user, "admin") == 0 && strcmp(pass, "admin") == 0);
             free(user); free(pass);
             if (!ok) { send_text(client, "401 Unauthorized", "text/plain", "Invalid admin credentials"); close(client); return; }
-            /* Admin dashboard content (simple) */
+
             const char *adm =
               "<!doctype html><html><head><meta charset='utf-8'><title>Admin Dashboard</title>"
               "<style>body{font-family:Arial;margin:18px} .card{max-width:900px;padding:18px;border-radius:10px;background:#fff;border:1px solid #eee} input,button{padding:8px;margin:6px 0;width:100%} button{background:#0b69ff;color:#fff;border:none;border-radius:6px}</style></head><body>"
               "<div class='card'><h2>Admin Dashboard</h2>"
-              "<p>Use the forms below to manage the system. (Demo: admin credentials are required on each form.)</p>"
+              "<p>Use the forms below to manage the system.</p>"
               "<h3>View all students</h3><p><a href='/list'>Open students list</a></p>"
               "<h3>Add student (admin)</h3>"
               "<form method='post' action='/add'>"
@@ -497,8 +503,8 @@ static void handle_client(int client) {
             close(client); return;
         }
 
-        /* STUDENT SIGNUP - reuse existing add-file style but from form */
-                            if (strncmp(path, "/student-signup", 16) == 0) {
+        /* --- Student sign-up (auto-add semester 1 subjects) --- */
+        if (strncmp(path, "/student-signup", 16) == 0) {
             char *name = form_value(body, "name");
             char *age = form_value(body, "age");
             char *sap = form_value(body, "sap_id");
@@ -544,7 +550,6 @@ static void handle_client(int client) {
             const int credits[7] = {5, 2, 2, 4, 5, 2, 2};
 
             for (int j = 0; j < 7; ++j) {
-                /* safe copy of subject name */
                 strncpy(s.subjects[j].name, default_subjects[j], sizeof(s.subjects[j].name) - 1);
                 s.subjects[j].name[sizeof(s.subjects[j].name) - 1] = '\0';
                 s.subjects[j].credits = credits[j];
@@ -581,60 +586,7 @@ static void handle_client(int client) {
             close(client); return;
         }
 
-            /* Default semester 1 subjects */
-            const char *default_subjects[7] = {
-                "Programming in C",
-                "Linux Lab",
-                "Problem Solving",
-                "Advanced Engineering Mathematics - I",
-                "Physics for Computer Engineers",
-                "Managing Self",
-                "Environmental Sustainability and Climate Change"
-            };
-            int credits[7] = {5, 2, 2, 4, 5, 2, 2};
-
-           for (int i = 0; i < 7; ++i) {
-    /* copy subject name safely and ensure null termination */
-    strncpy(s.subjects[i].name, default_subjects[i], sizeof(s.subjects[i].name) - 1);
-    s.subjects[i].name[sizeof(s.subjects[i].name) - 1] = '\0';
-
-    s.subjects[i].credits = credits[i];
-    s.subjects[i].marks = 0;
-    s.subjects[i].classes_held = 0;
-    s.subjects[i].classes_attended = 0;
-}
-
-
-            /* Call API to add student */
-            int addres = api_add_student(&s);
-            if (addres == -2) {
-                char resp[256];
-                snprintf(resp, sizeof(resp),
-                    "<!doctype html><html><body><p>SAP ID %d already registered. Try signing in.</p><p><a href='/'>Back</a></p></body></html>",
-                    s.id);
-                send_text(client, "409 Conflict", "text/html; charset=utf-8", resp);
-            } else if (addres <= 0) {
-                send_text(client, "500 Internal Server Error", "text/plain", "Unable to register");
-            } else {
-                char resp[512];
-                snprintf(resp, sizeof(resp),
-                    "<!doctype html><html><body><p>Registration successful!</p>"
-                    "<p>Your Student ID (SAP ID): <strong>%d</strong></p>"
-                    "<p>Default Semester 1 subjects have been added automatically.</p>"
-                    "<p><a href='/'>Back to Home</a></p></body></html>", addres);
-                send_text(client, "200 OK", "text/html; charset=utf-8", resp);
-            }
-
-        signup_cleanup:
-            if (name) free(name);
-            if (age) free(age);
-            if (sap) free(sap);
-            if (password) free(password);
-            close(client); return;
-        }
-
-
-        /* ADD student (admin / form) - reuses earlier /add logic used previously */
+        /* --- Admin: add student (form) --- */
         if (strncmp(path, "/add", 4) == 0) {
             char *name = form_value(body, "name");
             char *age = form_value(body, "age");
@@ -649,9 +601,9 @@ static void handle_client(int client) {
             }
             Student s; memset(&s, 0, sizeof(s));
             s.exists = 1; s.cgpa = 0.0; s.total_credits_completed = 0;
-            strncpy(s.name, name, sizeof(s.name)-1);
+            strncpy(s.name, name, sizeof(s.name)-1); s.name[sizeof(s.name)-1] = '\0';
             s.age = atoi(age);
-            strncpy(s.dept, dept, sizeof(s.dept)-1);
+            strncpy(s.dept, dept, sizeof(s.dept)-1); s.dept[sizeof(s.dept)-1] = '\0';
             s.year = atoi(year);
             s.num_subjects = atoi(num_sub);
             if (s.num_subjects < 1 || s.num_subjects > MAX_SUBJECTS) s.num_subjects = MAX_SUBJECTS;
@@ -661,11 +613,12 @@ static void handle_client(int client) {
             while (tok && si < s.num_subjects) {
                 while (*tok == ' ') tok++;
                 strncpy(s.subjects[si].name, tok, sizeof(s.subjects[si].name)-1);
+                s.subjects[si].name[sizeof(s.subjects[si].name)-1] = '\0';
                 s.subjects[si].classes_held = s.subjects[si].classes_attended = s.subjects[si].marks = s.subjects[si].credits = 0;
                 si++; tok = strtok(NULL, ",");
             }
             free(tmp);
-            strncpy(s.password, password, sizeof(s.password)-1);
+            strncpy(s.password, password, sizeof(s.password)-1); s.password[sizeof(s.password)-1] = '\0';
             api_add_student(&s);
             send_text(client, "200 OK", "text/html; charset=utf-8", "<p>Student added. <a href='/'>Back</a></p>");
         add_cleanup:
@@ -679,7 +632,7 @@ static void handle_client(int client) {
             close(client); return;
         }
 
-        /* ENTER MARKS (admin) */
+        /* --- Enter marks (admin) --- */
         if (strncmp(path, "/enter-marks", 12) == 0) {
             char *id_s = form_value(body, "id");
             char *marks = form_value(body, "marks");
@@ -714,7 +667,7 @@ static void handle_client(int client) {
             close(client); return;
         }
 
-        /* GENERATE REPORT */
+        /* --- Generate report --- */
         if (strncmp(path, "/generate", 9) == 0) {
             char *id_s = form_value(body, "id");
             char *college = form_value(body, "college");
@@ -732,9 +685,9 @@ static void handle_client(int client) {
             int idx = api_find_index_by_id(sid);
             if (idx == -1) { send_text(client, "404 Not Found", "text/plain", "Student not found"); if (college) free(college); if (semester) free(semester); if (exam) free(exam); close(client); return; }
             char cbuf[256] = "Your College", sbuf[128] = "Semester -", ebuf[128] = "Exam -";
-            if (college) { strncpy(cbuf, college, sizeof(cbuf)-1); free(college); }
-            if (semester) { strncpy(sbuf, semester, sizeof(sbuf)-1); free(semester); }
-            if (exam) { strncpy(ebuf, exam, sizeof(ebuf)-1); free(exam); }
+            if (college) { strncpy(cbuf, college, sizeof(cbuf)-1); cbuf[sizeof(cbuf)-1] = '\0'; free(college); }
+            if (semester) { strncpy(sbuf, semester, sizeof(sbuf)-1); sbuf[sizeof(sbuf)-1] = '\0'; free(semester); }
+            if (exam) { strncpy(ebuf, exam, sizeof(ebuf)-1); ebuf[sizeof(ebuf)-1] = '\0'; free(exam); }
             api_generate_report(idx, cbuf, sbuf, ebuf);
             char resp[256];
             snprintf(resp, sizeof(resp), "<p>Report generated: reports/%d_result.html <a href='/'>Back</a></p>", sid);
@@ -778,9 +731,3 @@ int main(int argc, char **argv) {
     close(server_fd);
     return 0;
 }
-
-
-
-
-
-
