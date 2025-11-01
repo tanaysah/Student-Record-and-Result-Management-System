@@ -520,13 +520,25 @@ static void handle_client(int client) {
             s.exists = 1; 
             s.cgpa = 0.0; 
             s.total_credits_completed = 0;
-            safe_strncpy(s.name, name, sizeof(s.name));
-            s.age = atoi(age);
-            safe_strncpy(s.dept, "B.Tech CSE", sizeof(s.dept)); /* Default department */
-            s.year = 1; /* Year 1 (semester 1 default) */
-            s.num_subjects = 7;
-            s.id = sapid; 
-            safe_strncpy(s.password, password, sizeof(s.password));
+           strncpy(s.name, name, sizeof(s.name) - 1);
+                        s.name[sizeof(s.name) - 1] = '\0';
+                        strncpy(s.dept, "B.Tech CSE", sizeof(s.dept) - 1);
+                        s.dept[sizeof(s.dept) - 1] = '\0';
+                        strncpy(s.password, password, sizeof(s.password) - 1);
+                        s.password[sizeof(s.password) - 1] = '\0';
+                        strncpy(s.subjects[i].name, default_subjects[i], sizeof(s.subjects[i].name) - 1);
+s.subjects[i].name[sizeof(s.subjects[i].name) - 1] = '\0';
+strncpy(s.name, name, sizeof(s.name) - 1);
+s.name[sizeof(s.name) - 1] = '\0';
+
+strncpy(s.dept, "B.Tech CSE", sizeof(s.dept) - 1);
+s.dept[sizeof(s.dept) - 1] = '\0';
+
+strncpy(s.password, password, sizeof(s.password) - 1);
+s.password[sizeof(s.password) - 1] = '\0';
+
+strncpy(s.subjects[i].name, default_subjects[i], sizeof(s.subjects[i].name) - 1);
+s.subjects[i].name[sizeof(s.subjects[i].name) - 1] = '\0';
 
             /* Default semester 1 subjects */
             const char *default_subjects[7] = {
@@ -721,6 +733,7 @@ int main(int argc, char **argv) {
     close(server_fd);
     return 0;
 }
+
 
 
 
