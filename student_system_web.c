@@ -192,22 +192,20 @@ static char *build_landing_page(void) {
         "</form>"
         "</div>";
 
-    const char *signup_card =
+       const char *signup_card =
         "<div class='card'>"
         "<h3>Student Sign Up</h3>"
         "<p>Create a new student account (self-registration).</p>"
         "<form method='post' action='/student-signup'>"
         "<input name='name' placeholder='Full name' required />"
         "<input name='age' placeholder='Age' required />"
-        "<input name='dept' placeholder='Department' required />"
-        "<input name='year' placeholder='Year (1-4)' required />"
-        "<input name='num_subjects' placeholder='Number of subjects (max 8)' required />"
-        "<input name='subjects' placeholder='Subjects comma-separated' required />"
+        "<input name='sap_id' placeholder='SAP ID (use this as your login ID)' required />"
         "<input name='password' placeholder='Password' type='password' required />"
         "<div style='margin-top:8px'><button>Sign up</button></div>"
         "</form>"
-        "<p class='muted'>After sign up you will receive an auto-generated student ID to use for login.</p>"
+        "<p class='muted'>Use your SAP ID to sign in after registration.</p>"
         "</div>";
+
 
     const char *signin_card =
         "<div class='card'>"
@@ -690,3 +688,4 @@ int main(int argc, char **argv) {
     close(server_fd);
     return 0;
 }
+
