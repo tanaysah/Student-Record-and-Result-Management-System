@@ -742,7 +742,16 @@ int cli_generate_report_arg(const char *arg) {
 /* ---------- API wrappers for web server linking ---------- */
 
 int api_find_index_by_id(int id) { return find_index_by_id(id); }
-int api_add_student(Student *s) { if (!s) return -1; if (s->id == 0) s->id = generate_unique_id(); add_student_custom(s); return s->id; }
+int api_add_student(Student *s) {
+    if (!s) return -1;
+    /* if caller provided an explicit id, check duplicate */
+    if (s->id != 0) {
+        if (find_index_by_id(s->id) != -1) return -2;
+    }
+    if (s->id == 0) s->id = generate_unique_id();
+    add_student_custom(s); /* add_student_custom also checks again and saves */
+    return s->id;
+}
 void api_generate_report(int idx, const char* college, const char* semester, const char* exam) { generate_html_report(idx, college, semester, exam); }
 int api_calculate_update_cgpa(int idx) { calculate_and_update_cgpa_for_student(idx); return 0; }
 
@@ -826,5 +835,6 @@ int main(int argc, char **argv) {
     return 0;
 }
 #endif /* BUILD_WEB */
+
 
 
