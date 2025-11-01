@@ -67,6 +67,8 @@ extern int api_find_index_by_id(int id);
 extern int api_add_student(Student *s);
 extern void api_generate_report(int idx, const char* college, const char* semester, const char* exam);
 extern int api_calculate_update_cgpa(int idx);
+/* persist helper from main C file */
+extern void save_data(void);
 
 /* filesystem helper */
 static void ensure_reports_dir(void) {
@@ -358,7 +360,6 @@ static char *build_student_dashboard(int idx) {
                  x, y, barw, barh);
         /* label (short) */
         char lbl[64]; html_escape_buf(s->subjects[i].name, lbl, sizeof(lbl));
-        /* trim label if too long */
         if (strlen(lbl) > 18) lbl[18] = '\0';
         snprintf(svg + strlen(svg), sizeof(svg)-strlen(svg),
                  "<text x='%d' y='%d' font-size='10' fill='#111'>%s</text>",
@@ -472,25 +473,23 @@ static void handle_client(int client) {
 
             const char *adm =
               "<!doctype html><html><head><meta charset='utf-8'><title>Admin Dashboard</title>"
-              "<style>body{font-family:Arial;margin:18px} .card{max-width:900px;padding:18px;border-radius:10px;background:#fff;border:1px solid #eee} input,button{padding:8px;margin:6px 0;width:100%} button{background:#0b69ff;color:#fff;border:none;border-radius:6px}</style></head><body>"
+              "<style>body{font-family:Arial;margin:18px} .card{max-width:900px;padding:18px;border-radius:10px;background:#fff;border:1px solid #eee} input,button,textarea{padding:8px;margin:6px 0;width:100%} button{background:#0b69ff;color:#fff;border:none;border-radius:6px}</style></head><body>"
               "<div class='card'><h2>Admin Dashboard</h2>"
-              "<p>Use the forms below to manage the system.</p>"
-              "<h3>View all students</h3><p><a href='/list'>Open students list</a></p>"
-              "<h3>Add student (admin)</h3>"
-              "<form method='post' action='/add'>"
-              "<input name='name' placeholder='Full name' required />"
-              "<input name='age' placeholder='Age' required />"
-              "<input name='dept' placeholder='Dept' required />"
-              "<input name='year' placeholder='Year' required />"
-              "<input name='num_subjects' placeholder='Number of subjects' required />"
-              "<input name='subjects' placeholder='Subjects comma-separated' required />"
-              "<input name='password' placeholder='Password' required />"
-              "<button>Add student</button></form>"
-              "<h3>Enter marks (admin)</h3>"
-              "<form method='post' action='/enter-marks'>"
+              "<p>Use the sections below to manage marks and attendance.</p>"
+              "<h3>View all students</h3><p><a href='/list' target='_blank'>Open students list</a></p>"
+              "<h3>Enter marks for a student</h3>"
+              "<p>Step 1: enter Student ID to load their subjects.</p>"
+              "<form method='post' action='/enter-marks-load'>"
               "<input name='id' placeholder='Student ID' required />"
-              "<textarea name='marks' rows='6' placeholder='90,3\\n85,4\\n78,3'></textarea>"
-              "<button>Submit marks</button></form>"
+              "<div style='margin-top:8px'><button>Load Subjects</button></div>"
+              "</form>"
+              "<h3>Mark attendance</h3>"
+              "<p>Enter the subject name (exact match) and choose date. Then mark present for each student.</p>"
+              "<form method='post' action='/attendance-load'>"
+              "<input name='subject' placeholder='Subject name (exact)' required />"
+              "<input name='date' placeholder='Date (YYYY-MM-DD) - optional (default today)' />"
+              "<div style='margin-top:8px'><button>Load Student List</button></div>"
+              "</form>"
               "<h3>Generate report</h3>"
               "<form method='post' action='/generate'>"
               "<input name='id' placeholder='Student ID' required />"
@@ -511,7 +510,11 @@ static void handle_client(int client) {
             char *password = form_value(body, "password");
             if (!name || !age || !sap || !password) {
                 send_text(client, "400 Bad Request", "text/plain", "Missing fields");
-                goto signup_cleanup;
+                if (name) free(name);
+                if (age) free(age);
+                if (sap) free(sap);
+                if (password) free(password);
+                close(client); return;
             }
 
             int sapid = atoi(sap);
@@ -520,7 +523,8 @@ static void handle_client(int client) {
                 snprintf(resp, sizeof(resp),
                     "<!doctype html><html><body><p>Invalid SAP ID provided. Use numeric SAP ID (e.g. 590012345).</p><p><a href='/'>Back</a></p></body></html>");
                 send_text(client, "400 Bad Request", "text/html; charset=utf-8", resp);
-                goto signup_cleanup;
+                free(name); free(age); free(sap); free(password);
+                close(client); return;
             }
 
             Student s; memset(&s, 0, sizeof(s));
@@ -558,7 +562,7 @@ static void handle_client(int client) {
                 s.subjects[j].classes_attended = 0;
             }
 
-            /* Save student (api_add_student returns -2 on duplicate id) */
+            /* Save student (api_add_student returns -2 on duplicate id - implement that behavior in student_system.c if desired) */
             int addres = api_add_student(&s);
             if (addres == -2) {
                 char resp[256];
@@ -578,92 +582,151 @@ static void handle_client(int client) {
                 send_text(client, "200 OK", "text/html; charset=utf-8", resp);
             }
 
-        signup_cleanup:
-            if (name) free(name);
-            if (age) free(age);
-            if (sap) free(sap);
-            if (password) free(password);
+            free(name); free(age); free(sap); free(password);
             close(client); return;
         }
 
-        /* --- Admin: add student (form) --- */
-        if (strncmp(path, "/add", 4) == 0) {
-            char *name = form_value(body, "name");
-            char *age = form_value(body, "age");
-            char *dept = form_value(body, "dept");
-            char *year = form_value(body, "year");
-            char *num_sub = form_value(body, "num_subjects");
-            char *subjects = form_value(body, "subjects");
-            char *password = form_value(body, "password");
-            if (!name || !age || !dept || !year || !num_sub || !subjects || !password) {
-                send_text(client, "400 Bad Request", "text/plain", "Missing fields");
-                goto add_cleanup;
-            }
-            Student s; memset(&s, 0, sizeof(s));
-            s.exists = 1; s.cgpa = 0.0; s.total_credits_completed = 0;
-            strncpy(s.name, name, sizeof(s.name)-1); s.name[sizeof(s.name)-1] = '\0';
-            s.age = atoi(age);
-            strncpy(s.dept, dept, sizeof(s.dept)-1); s.dept[sizeof(s.dept)-1] = '\0';
-            s.year = atoi(year);
-            s.num_subjects = atoi(num_sub);
-            if (s.num_subjects < 1 || s.num_subjects > MAX_SUBJECTS) s.num_subjects = MAX_SUBJECTS;
-            char *tmp = strdup(subjects);
-            char *tok = strtok(tmp, ",");
-            int si = 0;
-            while (tok && si < s.num_subjects) {
-                while (*tok == ' ') tok++;
-                strncpy(s.subjects[si].name, tok, sizeof(s.subjects[si].name)-1);
-                s.subjects[si].name[sizeof(s.subjects[si].name)-1] = '\0';
-                s.subjects[si].classes_held = s.subjects[si].classes_attended = s.subjects[si].marks = s.subjects[si].credits = 0;
-                si++; tok = strtok(NULL, ",");
-            }
-            free(tmp);
-            strncpy(s.password, password, sizeof(s.password)-1); s.password[sizeof(s.password)-1] = '\0';
-            api_add_student(&s);
-            send_text(client, "200 OK", "text/html; charset=utf-8", "<p>Student added. <a href='/'>Back</a></p>");
-        add_cleanup:
-            if (name) free(name);
-            if (age) free(age);
-            if (dept) free(dept);
-            if (year) free(year);
-            if (num_sub) free(num_sub);
-            if (subjects) free(subjects);
-            if (password) free(password);
-            close(client); return;
-        }
-
-        /* --- Enter marks (admin) --- */
-        if (strncmp(path, "/enter-marks", 12) == 0) {
+        /* --- Load subject-form for entering marks for a student (admin) --- */
+        if (strncmp(path, "/enter-marks-load", 17) == 0) {
             char *id_s = form_value(body, "id");
-            char *marks = form_value(body, "marks");
-            if (!id_s || !marks) {
-                send_text(client, "400 Bad Request", "text/plain", "Missing id or marks");
-                if (id_s) free(id_s);
-                if (marks) free(marks);
-                close(client); return;
-            }
+            if (!id_s) { send_text(client, "400 Bad Request", "text/plain", "Missing id"); close(client); return; }
             int sid = atoi(id_s);
             free(id_s);
             int idx = api_find_index_by_id(sid);
-            if (idx == -1) {
-                send_text(client, "404 Not Found", "text/plain", "Student not found");
-                free(marks); close(client); return;
+            if (idx == -1) { send_text(client, "404 Not Found", "text/plain", "Student not found"); close(client); return; }
+            Student *s = &students[idx];
+
+            size_t cap = 4096 + s->num_subjects * 256;
+            char *page = malloc(cap);
+            if (!page) { send_text(client, "500 Internal Server Error", "text/plain", "OOM"); close(client); return; }
+            snprintf(page, cap, "<!doctype html><html><head><meta charset='utf-8'><title>Enter Marks</title></head><body><h2>Enter marks for %s (ID %d)</h2><form method='post' action='/enter-marks-submit'>", s->name, s->id);
+            for (int i = 0; i < s->num_subjects; ++i) {
+                char tmp[512];
+                /* show subject name and an input; include hidden subidx field so server knows mapping */
+                snprintf(tmp, sizeof(tmp),
+                         "<label>%s (Credits: %d):<br><input name='mark_%d' placeholder='Marks (0-100)' required /></label>"
+                         "<input type='hidden' name='subidx_%d' value='%d' />",
+                         s->subjects[i].name, s->subjects[i].credits, i, i, i);
+                strncat(page, tmp, cap - strlen(page) - 1);
             }
-            char *line = strtok(marks, "\n");
-            int i = 0;
-            while (line && i < students[idx].num_subjects) {
-                int mk = 0, cr = 0;
-                if (sscanf(line, "%d,%d", &mk, &cr) == 2) {
-                    students[idx].subjects[i].marks = mk;
-                    students[idx].subjects[i].credits = cr;
+            char tail[256];
+            snprintf(tail, sizeof(tail), "<input type='hidden' name='id' value='%d' /><div style='margin-top:8px'><button>Submit Marks</button></div></form><p><a href='/'>Back</a></p></body></html>", s->id);
+            strncat(page, tail, cap - strlen(page) - 1);
+            send_text(client, "200 OK", "text/html; charset=utf-8", page);
+            free(page);
+            close(client); return;
+        }
+
+        /* --- Submit marks for a student (admin) --- */
+        if (strncmp(path, "/enter-marks-submit", 20) == 0) {
+            char *id_s = form_value(body, "id");
+            if (!id_s) { send_text(client, "400 Bad Request", "text/plain", "Missing id"); close(client); return; }
+            int sid = atoi(id_s); free(id_s);
+            int idx = api_find_index_by_id(sid);
+            if (idx == -1) { send_text(client, "404 Not Found", "text/plain", "Student not found"); close(client); return; }
+            Student *s = &students[idx];
+
+            for (int i = 0; i < s->num_subjects; ++i) {
+                char key[32];
+                snprintf(key, sizeof(key), "mark_%d", i);
+                char *mv = form_value(body, key);
+                if (mv) {
+                    int mk = atoi(mv);
+                    if (mk < 0) mk = 0;
+                    if (mk > 100) mk = 100;
+                    s->subjects[i].marks = mk;
+                    free(mv);
                 }
-                i++; line = strtok(NULL, "\n");
             }
-            free(marks);
+
             api_calculate_update_cgpa(idx);
+            save_data();
+
             char resp[256];
-            snprintf(resp, sizeof(resp), "<p>Marks updated for ID %d. <a href='/'>Back</a></p>", sid);
+            snprintf(resp, sizeof(resp), "<!doctype html><html><body><p>Marks saved for ID %d. <a href='/'>Back</a></p></body></html>", sid);
             send_text(client, "200 OK", "text/html; charset=utf-8", resp);
+            close(client); return;
+        }
+
+        /* --- Load attendance marking page for a subject (admin) --- */
+        if (strncmp(path, "/attendance-load", 16) == 0) {
+            char *subject = form_value(body, "subject");
+            char *date = form_value(body, "date"); /* optional */
+            if (!subject) { send_text(client, "400 Bad Request", "text/plain", "Missing subject"); if (date) free(date); close(client); return; }
+            char datebuf[64];
+            if (!date || date[0] == 0) {
+                time_t t = time(NULL); struct tm tm = *localtime(&t);
+                snprintf(datebuf, sizeof(datebuf), "%04d-%02d-%02d", tm.tm_year+1900, tm.tm_mon+1, tm.tm_mday);
+            } else {
+                strncpy(datebuf, date, sizeof(datebuf)-1); datebuf[sizeof(datebuf)-1] = '\0';
+            }
+
+            size_t cap = 8192 + student_count * 512;
+            char *page = malloc(cap);
+            if (!page) { send_text(client, "500", "text/plain", "OOM"); free(subject); if (date) free(date); close(client); return; }
+            snprintf(page, cap, "<!doctype html><html><head><meta charset='utf-8'><title>Mark Attendance</title></head><body><h2>Attendance for subject: %s on %s</h2><form method='post' action='/attendance-submit'>", subject, datebuf);
+
+            int found = 0;
+            for (int i = 0; i < student_count; ++i) {
+                if (!students[i].exists) continue;
+                for (int j = 0; j < students[i].num_subjects; ++j) {
+                    if (strcmp(students[i].subjects[j].name, subject) == 0) {
+                        char row[600];
+                        /* checkbox present_<id>, hidden studentid_<id> = "sid|subidx" */
+                        snprintf(row, sizeof(row), "<div style='margin:8px 0'><label><input type='checkbox' name='present_%d' /> Present</label> - ID: %d | %s</div><input type='hidden' name='studentid_%d' value='%d|%d' />", students[i].id, students[i].id, students[i].name, students[i].id, students[i].id, j);
+                        strncat(page, row, cap - strlen(page) - 1);
+                        found = 1;
+                        break;
+                    }
+                }
+            }
+            if (!found) strncat(page, "<p>No students found with that subject.</p>", cap - strlen(page) - 1);
+
+            char tail[512];
+            snprintf(tail, sizeof(tail), "<input type='hidden' name='subject' value='%s' /><input type='hidden' name='date' value='%s' /><div style='margin-top:12px'><button>Submit Attendance</button></div></form><p><a href='/'>Back</a></p></body></html>", subject, datebuf);
+            strncat(page, tail, cap - strlen(page) - 1);
+
+            send_text(client, "200 OK", "text/html; charset=utf-8", page);
+            free(page);
+            free(subject);
+            if (date) free(date);
+            close(client); return;
+        }
+
+        /* --- Submit attendance (admin) --- */
+        if (strncmp(path, "/attendance-submit", 18) == 0) {
+            char *subject = form_value(body, "subject");
+            char *date = form_value(body, "date");
+            if (!subject || !date) { send_text(client, "400", "text/plain", "Missing fields"); if (subject) free(subject); if (date) free(date); close(client); return; }
+
+            for (int i = 0; i < student_count; ++i) {
+                if (!students[i].exists) continue;
+                char hidkey[48];
+                snprintf(hidkey, sizeof(hidkey), "studentid_%d", students[i].id);
+                char *val = form_value(body, hidkey);
+                if (!val) continue;
+                int sid = 0, subidx = -1;
+                sscanf(val, "%d|%d", &sid, &subidx);
+                free(val);
+                if (sid != students[i].id || subidx < 0 || subidx >= students[i].num_subjects) continue;
+                /* increment classes held */
+                students[i].subjects[subidx].classes_held += 1;
+                /* check present checkbox */
+                char preskey[48];
+                snprintf(preskey, sizeof(preskey), "present_%d", students[i].id);
+                char *pres = form_value(body, preskey);
+                if (pres) {
+                    students[i].subjects[subidx].classes_attended += 1;
+                    free(pres);
+                }
+            }
+
+            save_data();
+
+            char resp[512];
+            snprintf(resp, sizeof(resp), "<!doctype html><html><body><p>Attendance recorded for subject '%s' on %s.</p><p><a href='/'>Back</a></p></body></html>", subject, date);
+            send_text(client, "200 OK", "text/html; charset=utf-8", resp);
+            free(subject); free(date);
             close(client); return;
         }
 
