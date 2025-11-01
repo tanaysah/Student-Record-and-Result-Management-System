@@ -498,7 +498,7 @@ static void handle_client(int client) {
         }
 
         /* STUDENT SIGNUP - reuse existing add-file style but from form */
-                     if (strncmp(path, "/student-signup", 16) == 0) {
+                            if (strncmp(path, "/student-signup", 16) == 0) {
             char *name = form_value(body, "name");
             char *age = form_value(body, "age");
             char *sap = form_value(body, "sap_id");
@@ -511,34 +511,75 @@ static void handle_client(int client) {
             int sapid = atoi(sap);
             if (sapid <= 0) {
                 char resp[256];
-                snprintf(resp, sizeof(resp), "<!doctype html><html><body><p>Invalid SAP ID provided. Use numeric SAP ID (e.g. 590012345).</p><p><a href='/'>Back</a></p></body></html>");
+                snprintf(resp, sizeof(resp),
+                    "<!doctype html><html><body><p>Invalid SAP ID provided. Use numeric SAP ID (e.g. 590012345).</p><p><a href='/'>Back</a></p></body></html>");
                 send_text(client, "400 Bad Request", "text/html; charset=utf-8", resp);
                 goto signup_cleanup;
             }
 
             Student s; memset(&s, 0, sizeof(s));
-            s.exists = 1; 
-            s.cgpa = 0.0; 
+            s.exists = 1;
+            s.cgpa = 0.0;
             s.total_credits_completed = 0;
-           strncpy(s.name, name, sizeof(s.name) - 1);
-                        s.name[sizeof(s.name) - 1] = '\0';
-                        strncpy(s.dept, "B.Tech CSE", sizeof(s.dept) - 1);
-                        s.dept[sizeof(s.dept) - 1] = '\0';
-                        strncpy(s.password, password, sizeof(s.password) - 1);
-                        s.password[sizeof(s.password) - 1] = '\0';
-                        strncpy(s.subjects[i].name, default_subjects[i], sizeof(s.subjects[i].name) - 1);
-s.subjects[i].name[sizeof(s.subjects[i].name) - 1] = '\0';
-strncpy(s.name, name, sizeof(s.name) - 1);
-s.name[sizeof(s.name) - 1] = '\0';
 
-strncpy(s.dept, "B.Tech CSE", sizeof(s.dept) - 1);
-s.dept[sizeof(s.dept) - 1] = '\0';
+            /* copy simple fields safely */
+            strncpy(s.name, name, sizeof(s.name) - 1); s.name[sizeof(s.name)-1] = '\0';
+            s.age = atoi(age);
+            strncpy(s.dept, "B.Tech CSE", sizeof(s.dept) - 1); s.dept[sizeof(s.dept)-1] = '\0';
+            s.year = 1; /* Default to year 1 / semester 1 */
+            s.num_subjects = 7;
+            s.id = sapid;
+            strncpy(s.password, password, sizeof(s.password) - 1); s.password[sizeof(s.password)-1] = '\0';
 
-strncpy(s.password, password, sizeof(s.password) - 1);
-s.password[sizeof(s.password) - 1] = '\0';
+            /* Default semester 1 subjects & credits */
+            const char *default_subjects[7] = {
+                "Programming in C",
+                "Linux Lab",
+                "Problem Solving",
+                "Advanced Engineering Mathematics - I",
+                "Physics for Computer Engineers",
+                "Managing Self",
+                "Environmental Sustainability and Climate Change"
+            };
+            const int credits[7] = {5, 2, 2, 4, 5, 2, 2};
 
-strncpy(s.subjects[i].name, default_subjects[i], sizeof(s.subjects[i].name) - 1);
-s.subjects[i].name[sizeof(s.subjects[i].name) - 1] = '\0';
+            for (int j = 0; j < 7; ++j) {
+                /* safe copy of subject name */
+                strncpy(s.subjects[j].name, default_subjects[j], sizeof(s.subjects[j].name) - 1);
+                s.subjects[j].name[sizeof(s.subjects[j].name) - 1] = '\0';
+                s.subjects[j].credits = credits[j];
+                s.subjects[j].marks = 0;
+                s.subjects[j].classes_held = 0;
+                s.subjects[j].classes_attended = 0;
+            }
+
+            /* Save student (api_add_student returns -2 on duplicate id) */
+            int addres = api_add_student(&s);
+            if (addres == -2) {
+                char resp[256];
+                snprintf(resp, sizeof(resp),
+                    "<!doctype html><html><body><p>SAP ID %d already registered. Try signing in.</p><p><a href='/'>Back</a></p></body></html>",
+                    s.id);
+                send_text(client, "409 Conflict", "text/html; charset=utf-8", resp);
+            } else if (addres <= 0) {
+                send_text(client, "500 Internal Server Error", "text/plain", "Unable to register");
+            } else {
+                char resp[512];
+                snprintf(resp, sizeof(resp),
+                    "<!doctype html><html><body><p>Registration successful!</p>"
+                    "<p>Your Student ID (SAP ID): <strong>%d</strong></p>"
+                    "<p>Default Semester 1 subjects have been added automatically.</p>"
+                    "<p><a href='/'>Back to Home</a></p></body></html>", addres);
+                send_text(client, "200 OK", "text/html; charset=utf-8", resp);
+            }
+
+        signup_cleanup:
+            if (name) free(name);
+            if (age) free(age);
+            if (sap) free(sap);
+            if (password) free(password);
+            close(client); return;
+        }
 
             /* Default semester 1 subjects */
             const char *default_subjects[7] = {
@@ -733,6 +774,7 @@ int main(int argc, char **argv) {
     close(server_fd);
     return 0;
 }
+
 
 
 
