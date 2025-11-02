@@ -1,4 +1,4 @@
-/* student_system.c
+/* student_system.c 
    Student Record, Attendance, Grades & Printable Result Report
    - Interactive console program (admin + student)
    - Non-interactive CLI modes for web hosting / automated use
@@ -9,7 +9,8 @@
      Web: gcc -DBUILD_WEB student_system.c student_system_web.c -o student_system_web
 
    Notes:
-     - Data persisted to students.dat (binary)
+     - Data persisted to students_v2.dat (binary). If an older students.dat exists,
+       the loader will attempt a basic migration to the new format.
      - Reports written to reports/<id>_result.html
 */
 
@@ -19,6 +20,7 @@
 #include <string.h>
 #include <ctype.h>
 #include <time.h>
+#include <sys/stat.h>
 
 #ifdef _WIN32
   #include <direct.h>
@@ -26,18 +28,19 @@
   #define MKDIR(d) _mkdir(d)
   #define isatty _isatty
 #else
-  #include <sys/stat.h>
   #include <sys/types.h>
   #include <unistd.h>
   #define MKDIR(d) mkdir(d, 0755)
 #endif
 
-#define DATA_FILE "students.dat"
+#define DATA_FILE_OLD "students.dat"
+#define DATA_FILE "students_v2.dat"
 #define REPORTS_DIR "reports"
 #define MAX_STUDENTS 2000
 #define MAX_NAME 100
-#define MAX_SUBJECTS 8
-#define MAX_SUB_NAME 50
+/* Increased to hold cumulative subjects across semesters */
+#define MAX_SUBJECTS 64
+#define MAX_SUB_NAME 100
 #define ADMIN_USER "admin"
 #define ADMIN_PASS "admin"
 
@@ -55,13 +58,33 @@ typedef struct {
     int age;
     char dept[MAX_NAME];
     int year;
+    int current_semester;
     int num_subjects;
     Subject subjects[MAX_SUBJECTS];
-    char password[50];
+    char password[64];
+    char email[128];
+    char phone[32];
     int exists;
     double cgpa;
     int total_credits_completed;
 } Student;
+
+/* For backward migration: old student layout (before we added email/phone/current_semester)
+   matches the layout used previously in older versions of this repository.
+*/
+typedef struct {
+    int id;
+    char name[MAX_NAME];
+    int age;
+    char dept[MAX_NAME];
+    int year;
+    int num_subjects;
+    Subject subjects[8];
+    char password[50];
+    int exists;
+    double cgpa;
+    int total_credits_completed;
+} OldStudent;
 
 /* Global in-memory storage (non-static so web wrapper can link) */
 Student students[MAX_STUDENTS];
@@ -86,29 +109,245 @@ static void pause_console(void) {
 }
 
 static void to_lower_str(char *s) {
-    for (; *s; ++s) *s = tolower((unsigned char)*s);
+    for (; *s; ++s) *s = (char)tolower((unsigned char)*s);
 }
 
-/* ---------- File operations ---------- */
+/* ---------- Semester subject catalogs ---------- */
+/* Each semester is represented by an array of strings and corresponding credits.
+   These reflect the subject lists the user provided.
+*/
+
+static const char *sem_subjects[][16] = {
+    /* index 0 unused - semesters start at 1 */
+    { NULL },
+    /* Semester 1 */
+    {
+        "Programming in C",
+        "Linux Lab",
+        "Problem Solving",
+        "Advanced Engineering Mathematics - I",
+        "Physics for Computer Engineers",
+        "Managing Self",
+        "Environmental Sustainability and Climate Change",
+        NULL
+    },
+    /* Semester 2 */
+    {
+        "Data Structures and Algorithms",
+        "Digital Electronics",
+        "Python Programming",
+        "Advanced Engineering Mathematics - II",
+        "Environmental Sustainability and Climate Change",
+        "Time and Priority Management",
+        "Elements of AI & ML",
+        NULL
+    },
+    /* Semester 3 */
+    {
+        "Leading Conversations",
+        "Discrete Mathematical Structures",
+        "Operating Systems",
+        "Elements of AIML",
+        "Database Management Systems",
+        "Design and Analysis of Algorithms",
+        NULL
+    },
+    /* Semester 4 */
+    {
+        "Software Engineering",
+        "EDGE-SoftSkills",
+        "Linear Algebra",
+        "Indian Constitution",
+        "Writing with Impact",
+        "Object Oriented Programming",
+        "Data Communication and Networks",
+        "Applied Machine Learning",
+        NULL
+    },
+    /* Semester 5 */
+    {
+        "Cryptography and Network Security",
+        "Formal Languages and Automata Theory",
+        "Object Oriented Analysis and Design",
+        "Exploratory-3",
+        "Start your Startup",
+        "Research Methodology in CS",
+        "Probability, Entropy, and MC Simulation",
+        "PE-2",
+        "PE-2 Lab",
+        NULL
+    },
+    /* Semester 6 */
+    {
+        "Exploratory-4",
+        "Leadership and Teamwork",
+        "Compiler Design",
+        "Statistics and Data Analysis",
+        "PE-3",
+        "PE-3 Lab",
+        "Minor Project",
+        NULL
+    },
+    /* Semester 7 */
+    {
+        "Exploratory-5",
+        "PE-4",
+        "PE-4 Lab",
+        "PE-5",
+        "PE-5 Lab",
+        "Capstone Project - Phase-1",
+        "Summer Internship",
+        NULL
+    },
+    /* Semester 8 */
+    {
+        "IT Ethical Practices",
+        "Capstone Project - Phase-2",
+        NULL
+    }
+};
+
+/* Credits per semester subjects (parallel arrays) */
+static const int sem_credits[][16] = {
+    { 0 },
+    /* sem1 */
+    {5,2,2,4,5,2,2, 0},
+    /* sem2 */
+    {5,3,5,4,2,2,3, 0},
+    /* sem3 */
+    {2,3,3,3,5,4, 0},
+    /* sem4 */
+    {3,0,3,0,2,4,4,5, 0},
+    /* sem5 */
+    {3,3,3,3,2,3,3,4,1, 0},
+    /* sem6 */
+    {3,2,3,3,4,1,5, 0},
+    /* sem7 */
+    {3,4,1,3,1,5,1, 0},
+    /* sem8 */
+    {3,5, 0}
+};
+
+/* Helper to get subject count for a semester */
+static int sem_subject_count(int sem) {
+    if (sem < 1 || sem > 8) return 0;
+    int c = 0;
+    while (sem_subjects[sem][c] != NULL && c < 16) c++;
+    return c;
+}
+
+/* Append subjects for semesters 1..sem to student s (no duplicates).
+   Returns number of subjects appended (or -1 on error).
+*/
+int populate_subjects_for_semesters(Student *s, int sem) {
+    if (!s || sem < 1) return -1;
+    if (sem > 8) sem = 8;
+    int added = 0;
+    for (int ss = 1; ss <= sem; ++ss) {
+        int cnt = sem_subject_count(ss);
+        for (int j = 0; j < cnt; ++j) {
+            const char *sname = sem_subjects[ss][j];
+            int credit = sem_credits[ss][j];
+            /* check existing */
+            int exists = 0;
+            for (int k = 0; k < s->num_subjects; ++k) {
+                if (strcmp(s->subjects[k].name, sname) == 0) { exists = 1; break; }
+            }
+            if (exists) continue;
+            if (s->num_subjects >= MAX_SUBJECTS) {
+                /* cannot add more */
+                continue;
+            }
+            safe_strncpy(s->subjects[s->num_subjects].name, sname, sizeof(s->subjects[s->num_subjects].name));
+            s->subjects[s->num_subjects].credits = credit;
+            s->subjects[s->num_subjects].marks = 0;
+            s->subjects[s->num_subjects].classes_held = 0;
+            s->subjects[s->num_subjects].classes_attended = 0;
+            s->num_subjects++;
+            added++;
+        }
+    }
+    return added;
+}
+
+/* ---------- File operations (with migration support) ---------- */
 
 void load_data(void) {
+    /* If v2 file exists, load it */
     FILE *fp = fopen(DATA_FILE, "rb");
-    if (!fp) {
-        student_count = 0;
-        for (int i = 0; i < MAX_STUDENTS; ++i) students[i].exists = 0;
-        return;
-    }
-    if (fread(&student_count, sizeof(student_count), 1, fp) != 1) {
+    if (fp) {
+        if (fread(&student_count, sizeof(student_count), 1, fp) != 1) {
+            fclose(fp);
+            student_count = 0;
+            for (int i = 0; i < MAX_STUDENTS; ++i) students[i].exists = 0;
+            return;
+        }
+        if (student_count < 0 || student_count > MAX_STUDENTS) student_count = 0;
+        if (fread(students, sizeof(Student), student_count, fp) < (size_t)student_count) {
+            /* tolerate truncated file */
+        }
         fclose(fp);
+        return;
+    }
+
+    /* Else attempt migration from old file (students.dat) if present */
+    FILE *fold = fopen(DATA_FILE_OLD, "rb");
+    if (!fold) {
+        /* nothing to load */
         student_count = 0;
         for (int i = 0; i < MAX_STUDENTS; ++i) students[i].exists = 0;
         return;
     }
-    if (student_count < 0 || student_count > MAX_STUDENTS) student_count = 0;
-    if (fread(students, sizeof(Student), student_count, fp) < (size_t)student_count) {
-        /* tolerate truncated file */
+    /* Read old header count and try to map old structs */
+    int old_count = 0;
+    if (fread(&old_count, sizeof(old_count), 1, fold) != 1) {
+        fclose(fold);
+        student_count = 0;
+        for (int i = 0; i < MAX_STUDENTS; ++i) students[i].exists = 0;
+        return;
     }
-    fclose(fp);
+    if (old_count < 0 || old_count > MAX_STUDENTS) old_count = 0;
+    OldStudent *oldbuf = calloc(old_count, sizeof(OldStudent));
+    if (!oldbuf) { fclose(fold); student_count = 0; for (int i = 0; i < MAX_STUDENTS; ++i) students[i].exists = 0; return; }
+    if (fread(oldbuf, sizeof(OldStudent), old_count, fold) < (size_t)old_count) {
+        /* truncated maybe - we'll only use what we read */
+    }
+    fclose(fold);
+
+    /* Map old to new */
+    student_count = 0;
+    for (int i = 0; i < old_count && student_count < MAX_STUDENTS; ++i) {
+        if (!oldbuf[i].exists) continue;
+        Student ns;
+        memset(&ns, 0, sizeof(ns));
+        ns.id = oldbuf[i].id;
+        safe_strncpy(ns.name, oldbuf[i].name, sizeof(ns.name));
+        ns.age = oldbuf[i].age;
+        safe_strncpy(ns.dept, oldbuf[i].dept, sizeof(ns.dept));
+        ns.year = oldbuf[i].year;
+        ns.current_semester = 1;
+        ns.num_subjects = oldbuf[i].num_subjects;
+        if (ns.num_subjects > MAX_SUBJECTS) ns.num_subjects = MAX_SUBJECTS;
+        for (int j = 0; j < ns.num_subjects; ++j) {
+            safe_strncpy(ns.subjects[j].name, oldbuf[i].subjects[j].name, sizeof(ns.subjects[j].name));
+            ns.subjects[j].marks = oldbuf[i].subjects[j].marks;
+            ns.subjects[j].credits = oldbuf[i].subjects[j].credits;
+            ns.subjects[j].classes_held = oldbuf[i].subjects[j].classes_held;
+            ns.subjects[j].classes_attended = oldbuf[i].subjects[j].classes_attended;
+        }
+        safe_strncpy(ns.password, oldbuf[i].password, sizeof(ns.password));
+        ns.exists = oldbuf[i].exists;
+        ns.cgpa = oldbuf[i].cgpa;
+        ns.total_credits_completed = oldbuf[i].total_credits_completed;
+        /* email/phone empty */
+        safe_strncpy(ns.email, "", sizeof(ns.email));
+        safe_strncpy(ns.phone, "", sizeof(ns.phone));
+        students[student_count++] = ns;
+    }
+    free(oldbuf);
+    /* Save to new file for future loads */
+    save_data();
+    return;
 }
 
 void save_data(void) {
@@ -266,6 +505,9 @@ void generate_html_report(int idx, const char* college, const char* semester, co
     fprintf(f, "<strong>ID:</strong> %d<br>\n", s->id);
     fprintf(f, "<strong>Dept:</strong> "); html_escape(f, s->dept); fprintf(f, "<br>\n");
     fprintf(f, "<strong>Year:</strong> %d<br>\n", s->year);
+    fprintf(f, "<strong>Current Semester:</strong> %d<br>\n", s->current_semester);
+    if (s->email[0]) { fprintf(f, "<strong>Email:</strong> "); html_escape(f, s->email); fprintf(f, "<br>\n"); }
+    if (s->phone[0]) { fprintf(f, "<strong>Phone:</strong> "); html_escape(f, s->phone); fprintf(f, "<br>\n"); }
     fprintf(f, "<strong>Semester:</strong> "); html_escape(f, semester ? semester : "Semester -"); fprintf(f, "<br>\n");
     fprintf(f, "<strong>Exam:</strong> "); html_escape(f, exam ? exam : "Exam -"); fprintf(f, "<br>\n");
     fprintf(f, "<strong>Date:</strong> %s</p>\n", datebuf);
@@ -291,8 +533,8 @@ void print_student_short(Student *s) {
 
 void print_student_full(Student *s) {
     printf("------------- Student Profile -------------\n");
-    printf("ID      : %d\nName    : %s\nAge     : %d\nDepartment: %s\nYear    : %d\nSubjects: %d\n",
-           s->id, s->name, s->age, s->dept, s->year, s->num_subjects);
+    printf("ID      : %d\nName    : %s\nAge     : %d\nDepartment: %s\nYear    : %d\nCurrent Semester: %d\nEmail   : %s\nPhone   : %s\nSubjects: %d\n",
+           s->id, s->name, s->age, s->dept, s->year, s->current_semester, s->email, s->phone, s->num_subjects);
     for (int i = 0; i < s->num_subjects; ++i) {
         Subject *sub = &s->subjects[i];
         int held = sub->classes_held, att = sub->classes_attended;
@@ -305,6 +547,9 @@ void print_student_full(Student *s) {
     printf("-------------------------------------------\n");
 }
 
+/* Adds a student record using provided Student struct (caller fills fields).
+   Checks duplicates based on provided id (if non-zero).
+*/
 void add_student_custom(Student *s) {
     if (!s) return;
     /* If an explicit non-zero id is provided, reject if duplicate */
@@ -322,6 +567,7 @@ void add_student_custom(Student *s) {
     printf("Student added successfully. ID: %d\n", s->id);
 }
 
+/* Interactive add student (manual) */
 void add_student(void) {
     Student s;
     memset(&s, 0, sizeof(s));
@@ -347,17 +593,17 @@ void add_student(void) {
     while (scanf("%d", &s.year) != 1) { clear_stdin(); printf("Invalid. Enter year: "); }
     clear_stdin();
 
-    if (find_duplicate_by_details(s.name, s.dept, s.year) != -1) { printf("Duplicate found. Registration cancelled.\n"); return; }
-    printf("How many subjects (max %d)? ", MAX_SUBJECTS);
-    while (scanf("%d", &s.num_subjects) != 1 || s.num_subjects < 1 || s.num_subjects > MAX_SUBJECTS) {
-        clear_stdin(); printf("Invalid. Enter number between 1 and %d: ", MAX_SUBJECTS);
-    }
+    printf("Enter email (optional): "); fgets(s.email, sizeof(s.email), stdin); s.email[strcspn(s.email, "\n")] = 0;
+    printf("Enter phone (optional): "); fgets(s.phone, sizeof(s.phone), stdin); s.phone[strcspn(s.phone, "\n")] = 0;
+    printf("Enter current semester (1-8), which will auto-add subjects up to this semester: ");
+    while (scanf("%d", &s.current_semester) != 1 || s.current_semester < 1 || s.current_semester > 8) { clear_stdin(); printf("Invalid. Enter semester 1-8: "); }
     clear_stdin();
-    for (int i = 0; i < s.num_subjects; ++i) {
-        printf("Enter name of subject %d: ", i+1);
-        fgets(s.subjects[i].name, sizeof(s.subjects[i].name), stdin); s.subjects[i].name[strcspn(s.subjects[i].name, "\n")] = 0;
-        s.subjects[i].classes_held = s.subjects[i].classes_attended = s.subjects[i].marks = s.subjects[i].credits = 0;
-    }
+
+    if (find_duplicate_by_details(s.name, s.dept, s.year) != -1) { printf("Duplicate found. Registration cancelled.\n"); return; }
+
+    s.num_subjects = 0;
+    populate_subjects_for_semesters(&s, s.current_semester);
+
     printf("Set password for this student (no spaces): ");
     fgets(s.password, sizeof(s.password), stdin); s.password[strcspn(s.password, "\n")] = 0;
     add_student_custom(&s);
@@ -379,23 +625,26 @@ void student_self_register(void) {
     printf("Enter age: "); while (scanf("%d", &s.age) != 1) { clear_stdin(); printf("Invalid. Enter age: "); } clear_stdin();
     printf("Enter department: "); fgets(s.dept, sizeof(s.dept), stdin); s.dept[strcspn(s.dept, "\n")] = 0;
     printf("Enter year (e.g., 1,2,3,4): "); while (scanf("%d", &s.year) != 1) { clear_stdin(); printf("Invalid. Enter year: "); } clear_stdin();
+    printf("Enter email (optional): "); fgets(s.email, sizeof(s.email), stdin); s.email[strcspn(s.email, "\n")] = 0;
+    printf("Enter phone (optional): "); fgets(s.phone, sizeof(s.phone), stdin); s.phone[strcspn(s.phone, "\n")] = 0;
+    printf("Enter current semester (1-8), which will auto-add subjects up to this semester: ");
+    while (scanf("%d", &s.current_semester) != 1 || s.current_semester < 1 || s.current_semester > 8) { clear_stdin(); printf("Invalid. Enter semester 1-8: "); }
+    clear_stdin();
 
     if (find_duplicate_by_details(s.name, s.dept, s.year) != -1) { printf("Duplicate. Registration cancelled.\n"); return; }
-    printf("How many subjects (max %d)? ", MAX_SUBJECTS);
-    while (scanf("%d", &s.num_subjects) != 1 || s.num_subjects < 1 || s.num_subjects > MAX_SUBJECTS) {
-        clear_stdin(); printf("Invalid. Enter number between 1 and %d: ", MAX_SUBJECTS);
-    }
-    clear_stdin();
-    for (int i = 0; i < s.num_subjects; ++i) {
-        printf("Enter name of subject %d: ", i+1);
-        fgets(s.subjects[i].name, sizeof(s.subjects[i].name), stdin); s.subjects[i].name[strcspn(s.subjects[i].name, "\n")] = 0;
-        s.subjects[i].classes_held = s.subjects[i].classes_attended = s.subjects[i].marks = s.subjects[i].credits = 0;
-    }
+
+    s.num_subjects = 0;
+    populate_subjects_for_semesters(&s, s.current_semester);
+
     printf("Set password for this student (no spaces): ");
     fgets(s.password, sizeof(s.password), stdin); s.password[strcspn(s.password, "\n")] = 0;
     add_student_custom(&s);
     printf("Registration complete. Use your ID and password to login.\n");
 }
+
+/* Remaining interactive functions (edit/delete/search/attendance) are preserved and lightly updated
+   to account for increased subject array size and new student fields.
+*/
 
 void edit_student(void) {
     int id;
@@ -406,7 +655,7 @@ void edit_student(void) {
     if (idx == -1) { printf("Student not found.\n"); return; }
     Student *s = &students[idx];
     print_student_full(s);
-    printf("What to edit?\n1) Name\n2) Age\n3) Dept\n4) Year\n5) Subjects\n6) Password\n7) Cancel\nChoose: ");
+    printf("What to edit?\n1) Name\n2) Age\n3) Dept\n4) Year\n5) Current semester & auto-add subjects\n6) Subjects\n7) Password\n8) Email\n9) Phone\n10) Cancel\nChoose: ");
     int ch;
     while (scanf("%d", &ch) != 1) { clear_stdin(); printf("Invalid. Choose: "); }
     clear_stdin();
@@ -416,14 +665,23 @@ void edit_student(void) {
         case 3: printf("New dept: "); fgets(s->dept, sizeof(s->dept), stdin); s->dept[strcspn(s->dept, "\n")] = 0; break;
         case 4: printf("New year: "); while (scanf("%d", &s->year) != 1) { clear_stdin(); printf("Invalid. Enter year: "); } clear_stdin(); break;
         case 5: {
+            printf("Set new current semester (1-8): ");
+            int sem; while (scanf("%d", &sem) != 1 || sem < 1 || sem > 8) { clear_stdin(); printf("Invalid. Enter semester 1-8: "); } clear_stdin();
+            s->current_semester = sem;
+            populate_subjects_for_semesters(s, sem);
+            break;
+        }
+        case 6: {
             printf("Subjects:\n"); for (int i = 0; i < s->num_subjects; ++i) printf("%d) %s\n", i+1, s->subjects[i].name);
             printf("Enter subject number to rename: ");
             int sn; while (scanf("%d", &sn) != 1 || sn < 1 || sn > s->num_subjects) { clear_stdin(); printf("Invalid. Enter subject number: "); }
             clear_stdin(); printf("New subject name: "); fgets(s->subjects[sn-1].name, sizeof(s->subjects[sn-1].name), stdin); s->subjects[sn-1].name[strcspn(s->subjects[sn-1].name, "\n")] = 0;
             break;
         }
-        case 6: printf("New password: "); fgets(s->password, sizeof(s->password), stdin); s->password[strcspn(s->password, "\n")] = 0; break;
-        case 7: printf("Edit cancelled.\n"); return;
+        case 7: printf("New password: "); fgets(s->password, sizeof(s->password), stdin); s->password[strcspn(s->password, "\n")] = 0; break;
+        case 8: printf("New email: "); fgets(s->email, sizeof(s->email), stdin); s->email[strcspn(s->email, "\n")] = 0; break;
+        case 9: printf("New phone: "); fgets(s->phone, sizeof(s->phone), stdin); s->phone[strcspn(s->phone, "\n")] = 0; break;
+        case 10: printf("Edit cancelled.\n"); return;
         default: printf("Invalid option.\n"); return;
     }
     save_data(); printf("Student updated.\n");
@@ -462,75 +720,71 @@ void search_student(void) {
     } else printf("Invalid option.\n");
 }
 
-/* Attendance functions */
-void mark_attendance_for_class(void) {
-    printf("Enter exact subject name to mark (case-sensitive): ");
-    char sname[MAX_SUB_NAME]; fgets(sname, sizeof(sname), stdin); sname[strcspn(sname, "\n")] = 0;
-    int any = 0;
-    for (int i = 0; i < student_count; ++i) {
-        if (!students[i].exists) continue;
-        Student *st = &students[i];
-        for (int j = 0; j < st->num_subjects; ++j) {
-            if (strcmp(st->subjects[j].name, sname) == 0) {
-                any = 1;
-                printf("Student ID %d | %s : Present? (y/n) : ", st->id, st->name);
-                char c = getchar(); clear_stdin();
-                st->subjects[j].classes_held += 1;
-                if (c == 'y' || c == 'Y') st->subjects[j].classes_attended += 1;
-                break;
-            }
-        }
-    }
-    if (!any) printf("No students have subject '%s'.\n", sname);
-    else { save_data(); printf("Attendance recorded.\n"); }
-}
+/* ---------- Attendance functions (APIs) ---------- */
 
-void mark_attendance_single_student(void) {
-    int id; printf("Enter student ID: "); while (scanf("%d", &id) != 1) { clear_stdin(); printf("Invalid. Enter student ID: "); } clear_stdin();
-    int idx = find_index_by_id(id); if (idx == -1) { printf("Not found.\n"); return; }
+/* Mark attendance for a given student and subject index (present=1 or 0). */
+int api_mark_attendance_for_student_subject(int student_id, int subject_index, int present) {
+    int idx = find_index_by_id(student_id);
+    if (idx == -1) return -1;
     Student *s = &students[idx];
-    for (int i = 0; i < s->num_subjects; ++i) printf("%d) %s (Attended %d / Held %d)\n", i+1, s->subjects[i].name, s->subjects[i].classes_attended, s->subjects[i].classes_held);
-    printf("Choose subject number: "); int sn; while (scanf("%d", &sn) != 1 || sn < 1 || sn > s->num_subjects) { clear_stdin(); printf("Invalid. Choose subject number: "); } clear_stdin();
-    int idxs = sn - 1; s->subjects[idxs].classes_held += 1;
-    printf("Present? (y/n): "); char c = getchar(); clear_stdin();
-    if (c == 'y' || c == 'Y') s->subjects[idxs].classes_attended += 1;
-    save_data(); printf("Attendance updated.\n");
+    if (subject_index < 0 || subject_index >= s->num_subjects) return -2;
+    s->subjects[subject_index].classes_held += 1;
+    if (present) s->subjects[subject_index].classes_attended += 1;
+    save_data();
+    return 0;
 }
 
-void increment_classes_held_only(void) {
-    printf("Enter exact subject name to increment classes held: ");
-    char sname[MAX_SUB_NAME]; fgets(sname, sizeof(sname), stdin); sname[strcspn(sname, "\n")] = 0;
+/* Mark attendance for a subject name across all students for a given date.
+   present_ids is an array of student IDs who are present; count is number of present IDs.
+   If date_str is non-NULL it will be used to write a log entry in "attendance_<date>.csv"
+   Format of CSV: id,subject_name,present(1/0)
+*/
+int api_mark_attendance_for_subject_on_date(const char *subject_name, const int *present_ids, int present_count, const char *date_str) {
+    if (!subject_name) return -1;
     int any = 0;
     for (int i = 0; i < student_count; ++i) {
         if (!students[i].exists) continue;
-        Student *st = &students[i];
-        for (int j = 0; j < st->num_subjects; ++j) {
-            if (strcmp(st->subjects[j].name, sname) == 0) { st->subjects[j].classes_held += 1; any = 1; }
-        }
-    }
-    if (!any) printf("No students have subject '%s'.\n", sname);
-    else { save_data(); printf("Classes held incremented.\n"); }
-}
-
-void attendance_report_subject(void) {
-    printf("Enter exact subject name for report: ");
-    char sname[MAX_SUB_NAME]; fgets(sname, sizeof(sname), stdin); sname[strcspn(sname, "\n")] = 0;
-    int found = 0; printf("Attendance report for '%s'\nID | Name | Attended | Held | %%\n", sname);
-    for (int i = 0; i < student_count; ++i) {
-        if (!students[i].exists) continue;
-        Student *st = &students[i];
-        for (int j = 0; j < st->num_subjects; ++j) {
-            if (strcmp(st->subjects[j].name, sname) == 0) {
-                int att = st->subjects[j].classes_attended; int held = st->subjects[j].classes_held;
-                double pct = (held==0)?0.0:((double)att/held)*100.0;
-                printf("%d | %s | %d | %d | %.2f%%\n", st->id, st->name, att, held, pct); found = 1;
+        Student *s = &students[i];
+        for (int j = 0; j < s->num_subjects; ++j) {
+            if (strcmp(s->subjects[j].name, subject_name) == 0) {
+                any = 1;
+                int present = 0;
+                for (int k = 0; k < present_count; ++k) if (present_ids[k] == s->id) { present = 1; break; }
+                s->subjects[j].classes_held += 1;
+                if (present) s->subjects[j].classes_attended += 1;
             }
         }
     }
-    if (!found) printf("No records for '%s'.\n", sname);
+    if (!any) return -2;
+
+    /* optional logging */
+    if (date_str) {
+        MKDIR("attendance");
+        char path[512];
+        snprintf(path, sizeof(path), "attendance/attendance_%s.csv", date_str);
+        FILE *f = fopen(path, "a");
+        if (f) {
+            for (int i = 0; i < student_count; ++i) {
+                if (!students[i].exists) continue;
+                Student *s = &students[i];
+                for (int j = 0; j < s->num_subjects; ++j) {
+                    if (strcmp(s->subjects[j].name, subject_name) == 0) {
+                        int present = 0;
+                        for (int k = 0; k < present_count; ++k) if (present_ids[k] == s->id) { present = 1; break; }
+                        fprintf(f, "%d,%s,%d\n", s->id, subject_name, present);
+                    }
+                }
+            }
+            fclose(f);
+        }
+    }
+
+    save_data();
+    return 0;
 }
 
-/* Student view functions */
+/* ---------- Student view functions ---------- */
+
 void student_view_profile(int idx) {
     if (idx < 0 || idx >= student_count) return;
     print_student_full(&students[idx]);
@@ -545,10 +799,42 @@ void student_view_sgpa_and_cgpa(int idx) {
     FILE *f = fopen(path, "r"); if (f) { fclose(f); printf("Printable result: %s\n", path); } else printf("No printable result yet.\n");
 }
 
-/* Forward declare interactive admin marks helper used in admin_menu */
-void admin_enter_marks_and_update_cgpa(void);
+/* ---------- Interactive admin marks handler ---------- */
 
-/* Menus & auth */
+void admin_enter_marks_and_update_cgpa(void) {
+    int id;
+    printf("Enter student ID to enter marks for: ");
+    while (scanf("%d", &id) != 1) { clear_stdin(); printf("Invalid. Enter student ID: "); }
+    clear_stdin();
+    int idx = find_index_by_id(id);
+    if (idx == -1) { printf("Student not found.\n"); return; }
+    Student *s = &students[idx];
+    if (s->num_subjects <= 0) { printf("Student has no subjects defined.\n"); return; }
+
+    printf("Entering marks for %s (ID: %d). Enter marks for each subject.\n", s->name, s->id);
+    for (int i = 0; i < s->num_subjects; ++i) {
+        int mk = -1;
+        printf("Subject %d) %s\n", i+1, s->subjects[i].name);
+        printf("  Enter marks (0-100): ");
+        while (scanf("%d", &mk) != 1 || mk < 0 || mk > 100) { clear_stdin(); printf("Invalid. Enter marks (0-100): "); }
+        clear_stdin();
+        s->subjects[i].marks = mk;
+        /* keep credits as existing */
+    }
+
+    /* Recalculate CGPA and save */
+    calculate_and_update_cgpa_for_student(idx);
+
+    /* Optionally generate report immediately */
+    MKDIR(REPORTS_DIR);
+    generate_html_report(idx, NULL, NULL, NULL);
+
+    save_data();
+    printf("Marks entered and CGPA updated for ID %d. Report generated (if possible).\n", id);
+}
+
+/* ---------- main menus & auth ---------- */
+
 int admin_menu(void) {
     while (1) {
         printf("\n=== ADMIN MENU ===\n1) Add student\n2) Edit student\n3) Delete student\n4) List students\n5) Search student\n6) Mark attendance (class)\n7) Mark attendance (single student)\n8) Increment classes held only\n9) Attendance report (subject)\n10) Enter marks & update CGPA for a student (generate report)\n11) Logout\nChoose: ");
@@ -559,10 +845,74 @@ int admin_menu(void) {
             case 3: delete_student(); break;
             case 4: { printf("List of students:\n"); for (int i=0;i<student_count;i++) if (students[i].exists) print_student_short(&students[i]); break; }
             case 5: search_student(); break;
-            case 6: mark_attendance_for_class(); break;
-            case 7: mark_attendance_single_student(); break;
-            case 8: increment_classes_held_only(); break;
-            case 9: attendance_report_subject(); break;
+            case 6: {
+                /* interactive class attendance by subject name and check present y/n */
+                printf("Enter exact subject name to mark (case-sensitive): ");
+                char sname[MAX_SUB_NAME]; fgets(sname, sizeof(sname), stdin); sname[strcspn(sname, "\n")] = 0;
+                int any = 0;
+                for (int i = 0; i < student_count; ++i) {
+                    if (!students[i].exists) continue;
+                    Student *st = &students[i];
+                    for (int j = 0; j < st->num_subjects; ++j) {
+                        if (strcmp(st->subjects[j].name, sname) == 0) {
+                            any = 1;
+                            printf("Student ID %d | %s : Present? (y/n) : ", st->id, st->name);
+                            char c = getchar(); clear_stdin();
+                            st->subjects[j].classes_held += 1;
+                            if (c == 'y' || c == 'Y') st->subjects[j].classes_attended += 1;
+                            break;
+                        }
+                    }
+                }
+                if (!any) printf("No students have subject '%s'.\n", sname);
+                else { save_data(); printf("Attendance recorded.\n"); }
+                break;
+            }
+            case 7: {
+                int id; printf("Enter student ID: "); while (scanf("%d", &id) != 1) { clear_stdin(); printf("Invalid. Enter student ID: "); } clear_stdin();
+                int idx = find_index_by_id(id); if (idx == -1) { printf("Not found.\n"); break; }
+                Student *s = &students[idx];
+                for (int i = 0; i < s->num_subjects; ++i) printf("%d) %s (Attended %d / Held %d)\n", i+1, s->subjects[i].name, s->subjects[i].classes_attended, s->subjects[i].classes_held);
+                printf("Choose subject number: "); int sn; while (scanf("%d", &sn) != 1 || sn < 1 || sn > s->num_subjects) { clear_stdin(); printf("Invalid. Choose subject number: "); } clear_stdin();
+                int idxs = sn - 1; s->subjects[idxs].classes_held += 1;
+                printf("Present? (y/n): "); char c = getchar(); clear_stdin();
+                if (c == 'y' || c == 'Y') s->subjects[idxs].classes_attended += 1;
+                save_data(); printf("Attendance updated.\n");
+                break;
+            }
+            case 8: {
+                printf("Enter exact subject name to increment classes held: ");
+                char sname[MAX_SUB_NAME]; fgets(sname, sizeof(sname), stdin); sname[strcspn(sname, "\n")] = 0;
+                int any = 0;
+                for (int i = 0; i < student_count; ++i) {
+                    if (!students[i].exists) continue;
+                    Student *st = &students[i];
+                    for (int j = 0; j < st->num_subjects; ++j) {
+                        if (strcmp(st->subjects[j].name, sname) == 0) { st->subjects[j].classes_held += 1; any = 1; }
+                    }
+                }
+                if (!any) printf("No students have subject '%s'.\n", sname);
+                else { save_data(); printf("Classes held incremented.\n"); }
+                break;
+            }
+            case 9: {
+                printf("Enter exact subject name for report: ");
+                char sname[MAX_SUB_NAME]; fgets(sname, sizeof(sname), stdin); sname[strcspn(sname, "\n")] = 0;
+                int found = 0; printf("Attendance report for '%s'\nID | Name | Attended | Held | %%\n", sname);
+                for (int i = 0; i < student_count; ++i) {
+                    if (!students[i].exists) continue;
+                    Student *st = &students[i];
+                    for (int j = 0; j < st->num_subjects; ++j) {
+                        if (strcmp(st->subjects[j].name, sname) == 0) {
+                            int att = st->subjects[j].classes_attended; int held = st->subjects[j].classes_held;
+                            double pct = (held==0)?0.0:((double)att/held)*100.0;
+                            printf("%d | %s | %d | %d | %.2f%%\n", st->id, st->name, att, held, pct); found = 1;
+                        }
+                    }
+                }
+                if (!found) printf("No records for '%s'.\n", sname);
+                break;
+            }
             case 10: {
                 admin_enter_marks_and_update_cgpa();
                 break;
@@ -590,7 +940,7 @@ int student_menu(int student_idx) {
                 break;
             }
             case 4: {
-                char oldp[50], newp[50];
+                char oldp[64], newp[64];
                 printf("Enter current password: "); fgets(oldp, sizeof(oldp), stdin); oldp[strcspn(oldp, "\n")] = 0;
                 if (strcmp(oldp, s->password) != 0) { printf("Wrong password.\n"); }
                 else { printf("Enter new password: "); fgets(newp, sizeof(newp), stdin); newp[strcspn(newp, "\n")] = 0; safe_strncpy(s->password, newp, sizeof(s->password)); save_data(); printf("Password changed.\n"); }
@@ -605,7 +955,7 @@ int student_menu(int student_idx) {
 }
 
 void admin_login(void) {
-    char user[50], pass[50];
+    char user[64], pass[64];
     printf("Admin Username: "); fgets(user, sizeof(user), stdin); user[strcspn(user, "\n")] = 0;
     printf("Admin Password: "); fgets(pass, sizeof(pass), stdin); pass[strcspn(pass, "\n")] = 0;
     if (strcmp(user, ADMIN_USER) == 0 && strcmp(pass, ADMIN_PASS) == 0) { printf("Admin authenticated.\n"); admin_menu(); }
@@ -615,7 +965,7 @@ void admin_login(void) {
 void student_login(void) {
     int id; printf("Enter student ID: "); while (scanf("%d", &id) != 1) { clear_stdin(); printf("Invalid. Enter student ID: "); } clear_stdin();
     int idx = find_index_by_id(id); if (idx == -1) { printf("Student ID not found.\n"); return; }
-    char pass[50]; printf("Enter password: "); fgets(pass, sizeof(pass), stdin); pass[strcspn(pass, "\n")] = 0;
+    char pass[64]; printf("Enter password: "); fgets(pass, sizeof(pass), stdin); pass[strcspn(pass, "\n")] = 0;
     if (strcmp(pass, students[idx].password) == 0) { printf("Welcome, %s!\n", students[idx].name); student_menu(idx); }
     else printf("Wrong password.\n");
 }
@@ -638,6 +988,7 @@ void main_menu(void) {
 
 /* add-file format (single line):
    name|age|dept|year|num_subjects|subject1,subject2,...|password
+   NOTE: this older CLI format does not include email/phone/current_semester.
 */
 int cli_add_from_file(const char *path) {
     FILE *f = fopen(path, "r");
@@ -726,6 +1077,7 @@ int cli_generate_report_arg(const char *arg) {
 /* ---------- API wrappers for web server linking ---------- */
 
 int api_find_index_by_id(int id) { return find_index_by_id(id); }
+
 int api_add_student(Student *s) {
     if (!s) return -1;
     /* if caller provided an explicit id, check duplicate */
@@ -733,53 +1085,33 @@ int api_add_student(Student *s) {
         if (find_index_by_id(s->id) != -1) return -2;
     }
     if (s->id == 0) s->id = generate_unique_id();
+    /* If current_semester present, populate that student's subjects up to that semester */
+    if (s->current_semester <= 0) s->current_semester = 1;
+    populate_subjects_for_semesters(s, s->current_semester);
     add_student_custom(s); /* add_student_custom also checks again and saves */
     return s->id;
 }
+
 void api_generate_report(int idx, const char* college, const char* semester, const char* exam) { generate_html_report(idx, college, semester, exam); }
+
 int api_calculate_update_cgpa(int idx) { calculate_and_update_cgpa_for_student(idx); return 0; }
 
-/* ---------- new: interactive admin marks handler (was missing) ---------- */
-/* ---------- API for admin auth (used by web wrapper) ---------- */
+/* ---------- new: admin auth API ---------- */
 int api_admin_auth(const char *user, const char *pass) {
     if (!user || !pass) return 0;
     if (strcmp(user, ADMIN_USER) == 0 && strcmp(pass, ADMIN_PASS) == 0) return 1;
     return 0;
 }
-/* Interactive admin function to enter marks for a student and update CGPA + generate report */
-void admin_enter_marks_and_update_cgpa(void) {
-    int id;
-    printf("Enter student ID to enter marks for: ");
-    while (scanf("%d", &id) != 1) { clear_stdin(); printf("Invalid. Enter student ID: "); }
-    clear_stdin();
-    int idx = find_index_by_id(id);
-    if (idx == -1) { printf("Student not found.\n"); return; }
-    Student *s = &students[idx];
-    if (s->num_subjects <= 0) { printf("Student has no subjects defined.\n"); return; }
 
-    printf("Entering marks for %s (ID: %d). Enter marks and credits for each subject.\n", s->name, s->id);
-    for (int i = 0; i < s->num_subjects; ++i) {
-        int mk = -1, cr = -1;
-        printf("Subject %d) %s\n", i+1, s->subjects[i].name);
-        printf("  Enter marks (0-100): ");
-        while (scanf("%d", &mk) != 1 || mk < 0 || mk > 100) { clear_stdin(); printf("Invalid. Enter marks (0-100): "); }
-        clear_stdin();
-        printf("  Enter credits (positive integer): ");
-        while (scanf("%d", &cr) != 1 || cr <= 0) { clear_stdin(); printf("Invalid. Enter credits (positive integer): "); }
-        clear_stdin();
-        s->subjects[i].marks = mk;
-        s->subjects[i].credits = cr;
-    }
+/* ---------- new: attendance API wrappers exposed to web layer ---------- */
+/* mark attendance for subject on date (present_ids is array of present student IDs) */
+int api_mark_attendance_for_subject_on_date_wrapper(const char *subject_name, const int *present_ids, int present_count, const char *date_str) {
+    return api_mark_attendance_for_subject_on_date(subject_name, present_ids, present_count, date_str);
+}
 
-    /* Recalculate CGPA and save */
-    calculate_and_update_cgpa_for_student(idx);
-
-    /* Optionally generate report immediately */
-    MKDIR(REPORTS_DIR);
-    generate_html_report(idx, NULL, NULL, NULL);
-
-    save_data();
-    printf("Marks entered and CGPA updated for ID %d. Report generated (if possible).\n", id);
+/* mark attendance for a single student subject index */
+int api_mark_attendance_for_student_subject_wrapper(int student_id, int subject_index, int present) {
+    return api_mark_attendance_for_student_subject(student_id, subject_index, present);
 }
 
 /* ---------- main (interactive) ---------- */
@@ -819,7 +1151,3 @@ int main(int argc, char **argv) {
     return 0;
 }
 #endif /* BUILD_WEB */
-
-
-
-
