@@ -629,11 +629,11 @@ static void handle_client(int client) {
                 if (p) { strncpy(pass, p, sizeof(pass)-1); free(p); }
                 free(qs);
             }
-            if (id <= 0 || pass[0]==0) {
-                send_text(client, "400 Bad Request", "text/plain", "Missing id or pass (use the sign-in form).",
-                          );
-                close(client); return;
-            }
+           if (id <= 0 || pass[0]==0) {
+    send_text(client, "400 Bad Request", "text/plain", "Missing id or pass (use the sign-in form).");
+    close(client); return;
+}
+
             int idx = api_find_index_by_id(id);
             if (idx == -1) { send_text(client, "404 Not Found", "text/plain", "Student not found"); close(client); return; }
             if (strcmp(pass, students[idx].password) != 0) { send_text(client, "401 Unauthorized", "text/plain", "Wrong password"); close(client); return; }
@@ -767,14 +767,13 @@ static void handle_client(int client) {
             }
             int sapid = atoi(sap);
             int sem = atoi(semester);
-            if (sapid <= 0 || sem < 1 || sem > 8) {
-                char resp[256];
-                snprintf(resp, sizeof(resp),
-                    "<!doctype html><html><body><p>Invalid SAP ID or semester provided.</p><p><a href='/'>Back</a></p></body></html>",
-                    s.id);
-                send_text(client, "400 Bad Request", "text/html; charset=utf-8", resp);
-                goto signup_cleanup;
-            }
+           if (sapid <= 0 || sem < 1 || sem > 8) {
+    char resp[256];
+    snprintf(resp, sizeof(resp),
+        "<!doctype html><html><body><p>Invalid SAP ID or semester provided.</p><p><a href='/'>Back</a></p></body></html>");
+    send_text(client, "400 Bad Request", "text/html; charset=utf-8", resp);
+    goto signup_cleanup;
+}
             Student s; memset(&s, 0, sizeof(s));
             s.exists = 1; s.cgpa = 0.0; s.total_credits_completed = 0;
             s.id = sapid;
@@ -985,3 +984,4 @@ int main(int argc, char **argv) {
     close(server_fd);
     return 0;
 }
+
