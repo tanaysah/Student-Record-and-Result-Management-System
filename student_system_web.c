@@ -439,6 +439,8 @@ static char *build_list_html(void) {
    - groups subjects by semester
    - displays deterministic default marks/attendance for earlier semesters when data is empty
    - shows semester-wise attendance distribution (bar chart)
+   - shows semester SGPA for each semester and overall CGPA computed from available (or defaulted) marks
+   - newest semester shown at the top
 */
 static char *build_student_dashboard(int idx) {
     if (idx < 0 || idx >= student_count) return NULL;
@@ -446,14 +448,16 @@ static char *build_student_dashboard(int idx) {
     char escaped_name[256]; html_escape_buf(s->name, escaped_name, sizeof(escaped_name));
 
     /* Prepare semester buckets 1..8 */
-    char sem_tables[9][8192];
+    char sem_tables[9][16384];
     int sem_caps[9];
-    for (int i=0;i<9;++i) { sem_tables[i][0]=0; sem_caps[i]=8192; }
+    for (int i=0;i<9;++i) { sem_tables[i][0]=0; sem_caps[i]=16384; }
 
-    /* We will also compute semester-wise average attendance */
+    /* We will also compute semester-wise averages and SGPA */
     int sem_subject_counts[9] = {0};
     int sem_attended_sum[9] = {0};
     int sem_held_sum[9] = {0};
+    double sem_weighted_sum[9] = {0.0};
+    int sem_credits_sum[9] = {0};
 
     /* helper local buffers */
     char sname_esc[256];
@@ -464,19 +468,25 @@ static char *build_student_dashboard(int idx) {
         if (subj_sem <= 0) subj_sem = 0; /* put unknown into 0 bucket (we will show later) */
 
         /* determine display marks and attendance: if stored values are zero AND
-           subject belongs to a semester earlier than or equal to current_semester - 1,
-           produce deterministic defaults so dashboard shows meaningful data */
+           subject belongs to a semester earlier than current_semester, or is current_semester
+           but has no marks, produce deterministic defaults so dashboard shows meaningful data */
         int disp_marks = s->subjects[i].marks;
         int held = s->subjects[i].classes_held;
         int att = s->subjects[i].classes_attended;
 
-        if (s->current_semester > 1 && subj_sem > 0 && subj_sem < s->current_semester) {
-            /* for past semesters: if there's no real data, create deterministic defaults */
-            if (disp_marks == 0 && held == 0) {
-                unsigned int h = deterministic_hash(subjname, (unsigned int)s->id);
-                disp_marks = 45 + (h % 46); /* 45..90-ish */
-                held = 20 + (h % 21);      /* 20..40 classes held */
-                att = (held * (50 + ((h >> 8) % 51))) / 100; /* attendance 50%-100% */
+        if ((subj_sem > 0 && subj_sem <= s->current_semester)) {
+            if (disp_marks == 0 || held == 0) {
+                unsigned int h = deterministic_hash(subjname, (unsigned int)s->id ^ (unsigned int)subj_sem);
+                /* For current semester, bias slightly higher to look realistic */
+                if (subj_sem == s->current_semester) {
+                    disp_marks = 50 + (h % 51); /* 50..100 */
+                    held = 6 + (h % 15);        /* 6..20 classes held */
+                    att = (held * (60 + ((h >> 7) % 41))) / 100; /* 60%-100% */
+                } else {
+                    disp_marks = 45 + (h % 46); /* 45..90 */
+                    held = 20 + (h % 21);      /* 20..40 classes held */
+                    att = (held * (50 + ((h >> 8) % 51))) / 100; /* attendance 50%-100% */
+                }
             }
         }
 
@@ -488,24 +498,45 @@ static char *build_student_dashboard(int idx) {
 
         /* build a row */
         char row[512];
-        snprintf(row, sizeof(row), "<tr><td>%s</td><td>%d</td><td>%d</td><td>%.0f</td><td>%d%%</td></tr>", sname_esc, disp_marks, s->subjects[i].credits, (double)gp, (held==0?0:(int)(((double)att/held)*100.0 + 0.5)));
+        int pct_att = (held==0?0:(int)(((double)att/held)*100.0 + 0.5));
+        snprintf(row, sizeof(row), "<tr><td>%s</td><td>%d</td><td>%d</td><td>%.0f</td><td>%d%%</td></tr>", sname_esc, disp_marks, s->subjects[i].credits, (double)gp, pct_att);
 
         int semidx = subj_sem;
         if (semidx < 0 || semidx > 8) semidx = 0;
         if (strlen(sem_tables[semidx]) + strlen(row) + 256 > (size_t)sem_caps[semidx]) {
-            sem_caps[semidx] *= 2; /* grow but stack buffers are fixed; in practice subjects small */
+            /* grow not strictly necessary here since we allocated larger buffers */
         }
         strncat(sem_tables[semidx], row, sizeof(sem_tables[semidx]) - strlen(sem_tables[semidx]) - 1);
 
-        /* accumulate for semester attendance averages */
+        /* accumulate for semester attendance averages and SGPA */
         if (held > 0) {
             sem_subject_counts[semidx]++;
             sem_attended_sum[semidx] += att;
             sem_held_sum[semidx] += held;
         }
+        if (s->subjects[i].credits > 0) {
+            sem_weighted_sum[semidx] += (double)marks_to_grade_point_local(disp_marks) * s->subjects[i].credits;
+            sem_credits_sum[semidx] += s->subjects[i].credits;
+        }
     }
 
-    /* Build semester-wise attendance SVG (one bar per semester 1..current_semester) */
+    /* Compute per-semester SGPAs and overall CGPA (using semesters up to current_semester)
+       Use deterministic/defaulted marks where real data missing (we already used disp_marks above)
+    */
+    double sem_sgpa[9] = {0.0};
+    int total_credits_all = 0; double total_weighted_all = 0.0;
+    for (int sem = 1; sem <= s->current_semester && sem <= 8; ++sem) {
+        if (sem_credits_sum[sem] > 0) {
+            sem_sgpa[sem] = sem_weighted_sum[sem] / (double)sem_credits_sum[sem];
+            total_weighted_all += sem_weighted_sum[sem];
+            total_credits_all += sem_credits_sum[sem];
+        } else {
+            sem_sgpa[sem] = 0.0;
+        }
+    }
+    double overall_cgpa = (total_credits_all > 0) ? (total_weighted_all / (double)total_credits_all) : s->cgpa;
+
+    /* Build semester-wise attendance SVG (one bar per semester current..1) */
     int max_sem = s->current_semester;
     if (max_sem < 1) max_sem = 1;
     if (max_sem > 8) max_sem = 8;
@@ -517,15 +548,15 @@ static char *build_student_dashboard(int idx) {
     snprintf(svg + strlen(svg), sizeof(svg)-strlen(svg), "<line x1='%d' y1='%d' x2='%d' y2='%d' stroke='#eee'/>", pad, h-pad, w-pad, h-pad);
     int barw = (max_sem>0) ? ((w - pad*2) / max_sem - 8) : 20;
     if (barw < 8) barw = 8;
-    for (int sem = 1; sem <= max_sem; ++sem) {
-        int x = pad + (sem-1)*(barw+8);
+    for (int i = 0; i < max_sem; ++i) {
+        int sem = max_sem - i; /* latest first */
+        int x = pad + i*(barw+8);
         int pct = 0;
         if (sem_held_sum[sem] > 0) {
             pct = (int)((double)sem_attended_sum[sem] / (double)sem_held_sum[sem] * 100.0 + 0.5);
         } else {
-            /* If no data, create a deterministic default for the semester based on student id + sem */
-            unsigned int h = deterministic_hash("SEM", (unsigned int)(s->id ^ sem));
-            pct = 55 + (h % 41); /* 55..95 */
+            unsigned int hsh = deterministic_hash("SEM", (unsigned int)(s->id ^ sem));
+            pct = 55 + (hsh % 41); /* 55..95 */
         }
         if (pct > 100) pct = 100;
         int barh = (pct * (h - pad*2)) / 100;
@@ -544,24 +575,25 @@ static char *build_student_dashboard(int idx) {
 
     const char *tpl_end = "<p><a href='/'>← Back to Home</a></p></div></body></html>";
 
-    size_t cap = strlen(tpl_start) + 8192 + 8192 + strlen(svg) + 2048;
+    size_t cap = strlen(tpl_start) + 32768 + strlen(svg) + 4096;
     char *buf = malloc(cap);
     if (!buf) return NULL;
     strcpy(buf, tpl_start);
     char header[512];
     char dept_esc[256]; html_escape_buf(s->dept, dept_esc, sizeof(dept_esc));
-    double sgpa = compute_sgpa_local(s);
+    double sgpa_current = sem_sgpa[s->current_semester];
+    if (sgpa_current == 0.0) sgpa_current = compute_sgpa_local(s); /* fallback */
     snprintf(header, sizeof(header),
              "<h2>Welcome, %s</h2><p>ID: %d | Dept: %s | Year: %d | Semester: %d | Age: %d</p>"
-             "<p><strong>SGPA (current):</strong> %.3f  &nbsp;&nbsp; <strong>Stored CGPA:</strong> %.3f (Credits: %d)</p>",
-             escaped_name, s->id, dept_esc, s->year, s->current_semester, s->age, sgpa, s->cgpa, s->total_credits_completed);
+             "<p><strong>SGPA (current semester %d):</strong> %.3f  &nbsp;&nbsp; <strong>Overall CGPA:</strong> %.3f (Credits: %d)</p>",
+             escaped_name, s->id, dept_esc, s->year, s->current_semester, s->age, s->current_semester, sgpa_current, overall_cgpa, total_credits_all);
     strcat(buf, header);
     strcat(buf, "<h3>Semester-wise Attendance</h3>");
     strcat(buf, svg);
 
-    /* For each semester, render a table if it has subjects (or if sem <= current_semester show even empty) */
-    for (int sem=1; sem<=s->current_semester && sem<=8; ++sem) {
-        char semtitle[128]; snprintf(semtitle, sizeof(semtitle), "<h3>Semester %d</h3>", sem);
+    /* For each semester, render a table, newest first */
+    for (int sem = s->current_semester; sem >= 1 && sem <= 8; --sem) {
+        char semtitle[256]; snprintf(semtitle, sizeof(semtitle), "<h3>Semester %d - SGPA: %.3f</h3>", sem, sem_sgpa[sem]);
         strcat(buf, semtitle);
         strcat(buf, "<table><tr><th>Subject</th><th>Marks</th><th>Credits</th><th>GradePoint</th><th>Attendance</th></tr>");
         if (strlen(sem_tables[sem]) == 0) {
@@ -572,7 +604,7 @@ static char *build_student_dashboard(int idx) {
         strcat(buf, "</table>");
     }
 
-    /* Unknown/other subjects (seminar/project extras) */
+    /* Unknown/other subjects (extras) */
     if (strlen(sem_tables[0]) > 0) {
         strcat(buf, "<h3>Other Subjects</h3><table><tr><th>Subject</th><th>Marks</th><th>Credits</th><th>GradePoint</th><th>Attendance</th></tr>");
         strcat(buf, sem_tables[0]);
@@ -629,11 +661,11 @@ static void handle_client(int client) {
                 if (p) { strncpy(pass, p, sizeof(pass)-1); free(p); }
                 free(qs);
             }
-           if (id <= 0 || pass[0]==0) {
-    send_text(client, "400 Bad Request", "text/plain", "Missing id or pass (use the sign-in form).");
-    close(client); return;
-}
-
+            if (id <= 0 || pass[0]==0) {
+                send_text(client, "400 Bad Request", "text/plain", "Missing id or pass (use the sign-in form).",
+                          );
+                close(client); return;
+            }
             int idx = api_find_index_by_id(id);
             if (idx == -1) { send_text(client, "404 Not Found", "text/plain", "Student not found"); close(client); return; }
             if (strcmp(pass, students[idx].password) != 0) { send_text(client, "401 Unauthorized", "text/plain", "Wrong password"); close(client); return; }
@@ -767,13 +799,14 @@ static void handle_client(int client) {
             }
             int sapid = atoi(sap);
             int sem = atoi(semester);
-           if (sapid <= 0 || sem < 1 || sem > 8) {
-    char resp[256];
-    snprintf(resp, sizeof(resp),
-        "<!doctype html><html><body><p>Invalid SAP ID or semester provided.</p><p><a href='/'>Back</a></p></body></html>");
-    send_text(client, "400 Bad Request", "text/html; charset=utf-8", resp);
-    goto signup_cleanup;
-}
+            if (sapid <= 0 || sem < 1 || sem > 8) {
+                char resp[256];
+                snprintf(resp, sizeof(resp),
+                    "<!doctype html><html><body><p>Invalid SAP ID or semester provided.</p><p><a href='/'>Back</a></p></body></html>",
+                    s.id);
+                send_text(client, "400 Bad Request", "text/html; charset=utf-8", resp);
+                goto signup_cleanup;
+            }
             Student s; memset(&s, 0, sizeof(s));
             s.exists = 1; s.cgpa = 0.0; s.total_credits_completed = 0;
             s.id = sapid;
@@ -984,4 +1017,3 @@ int main(int argc, char **argv) {
     close(server_fd);
     return 0;
 }
-
