@@ -6,11 +6,6 @@
    - Student dashboard: attendance chart, subjects, marks, SGPA, CGPA
    Compile with:
      gcc -DBUILD_WEB student_system.c student_system_web.c -o student_system_web
-
-   UPDATED:
-   - Attendance flow (semester -> subject -> mark attendance)
-   - Marks flow (enter student id -> load current semester subjects table -> admin fills marks)
-   - Student dashboard groups by semester, deterministic defaults for display where missing
 */
 
 #define _GNU_SOURCE
@@ -152,7 +147,7 @@ static int marks_to_grade_point_local(int marks) {
     return 0;
 }
 
-/* compute SGPA locally (used as fallback) */
+/* compute SGPA locally */
 static double compute_sgpa_local(const Student *s) {
     int total_credits = 0;
     double weighted = 0.0;
@@ -201,70 +196,6 @@ static void add_subjects_to_student(Student *s, const char **list, const int *cr
         s->subjects[s->num_subjects].classes_attended = 0;
         s->num_subjects++;
     }
-}
-
-/* --- Semester arrays (duplicate of student_system.c lists to allow grouping in dashboard) --- */
-static const char *sem1[] = {
-    "Programming in C","Linux Lab","Problem Solving","Advanced Engineering Mathematics - I","Physics for Computer Engineers","Managing Self","Environmental Sustainability and Climate Change", NULL
-};
-static const int sem1_c[] = {5,2,2,4,5,2,2};
-static const char *sem2[] = {
-    "Data Structures and Algorithms","Digital Electronics","Python Programming","Advanced Engineering Mathematics - II","Environmental Sustainability and Climate Change","Time and Priority Management","Elements of AI/ML", NULL
-};
-static const int sem2_c[] = {5,3,5,4,2,2,3};
-static const char *sem3[] = {
-    "Leading Conversations","Discrete Mathematical Structures","Operating Systems","Elements of AI/ML","Database Management Systems","Design and Analysis of Algorithms", NULL
-};
-static const int sem3_c[] = {2,3,3,3,5,4};
-static const char *sem4[] = {
-    "Software Engineering","EDGE - Soft Skills","Linear Algebra","Indian Constitution","Writing with Impact","Object Oriented Programming","Data Communication and Networks","Applied Machine Learning", NULL
-};
-static const int sem4_c[] = {3,0,3,0,2,4,4,5};
-static const char *sem5[] = {
-    "Cryptography and Network Security","Formal Languages and Automata Theory","Object Oriented Analysis and Design","Exploratory-3","Start your Startup","Research Methodology in CS","Probability, Entropy, and MC Simulation","PE-2","PE-2 Lab", NULL
-};
-static const int sem5_c[] = {3,3,3,3,2,3,3,4,1};
-static const char *sem6[] = {
-    "Exploratory-4","Leadership and Teamwork","Compiler Design","Statistics and Data Analysis","PE-3","PE-3 Lab","Minor Project", NULL
-};
-static const int sem6_c[] = {3,2,3,3,4,1,5};
-static const char *sem7[] = {
-    "Exploratory-5","PE-4","PE-4 Lab","PE-5","PE-5 Lab","Capstone Project - Phase-1","Summer Internship", NULL
-};
-static const int sem7_c[] = {3,4,1,3,1,5,1};
-static const char *sem8[] = {
-    "IT Ethical Practices","Capstone Project - Phase-2", NULL
-};
-static const int sem8_c[] = {3,5};
-
-/* helper: deterministic hash to produce repeatable 'random' values per student+subject */
-static unsigned int deterministic_hash(const char *s, unsigned int seed) {
-    unsigned int h = seed ^ 2166136261u;
-    while (*s) {
-        h ^= (unsigned char)(*s++);
-        h *= 16777619u;
-    }
-    /* further scramble */
-    h ^= (h >> 16);
-    h *= 0x85ebca6b;
-    h ^= (h >> 13);
-    h *= 0xc2b2ae35;
-    h ^= (h >> 16);
-    return h;
-}
-
-/* determine semester index for a subject name by searching the semester arrays above
-   returns 1..8 if found, 0 if unknown */
-static int subject_semester(const char *sname) {
-    const char **lists[] = { NULL, sem1, sem2, sem3, sem4, sem5, sem6, sem7, sem8 };
-    for (int sem=1; sem<=8; ++sem) {
-        const char **lst = lists[sem];
-        if (!lst) continue;
-        for (int j=0; lst[j]!=NULL; ++j) {
-            if (strcmp(lst[j], sname) == 0) return sem;
-        }
-    }
-    return 0;
 }
 
 /* Build landing page (signup includes extra fields) */
@@ -434,132 +365,49 @@ static char *build_list_html(void) {
     return buf;
 }
 
-/* build student dashboard as HTML with attendance & marks (UPDATED)
-   - groups subjects by semester
-   - displays deterministic default marks/attendance for earlier semesters when data is empty
-   - shows semester-wise attendance distribution (bar chart)
-   - shows semester SGPA for each semester and overall CGPA computed from available (or defaulted) marks
-   - newest semester shown at the top
-*/
+/* build student dashboard as HTML with attendance & marks */
 static char *build_student_dashboard(int idx) {
     if (idx < 0 || idx >= student_count) return NULL;
     Student *s = &students[idx];
     char escaped_name[256]; html_escape_buf(s->name, escaped_name, sizeof(escaped_name));
-
-    /* Prepare semester buckets 1..8 */
-    char sem_tables[9][16384];
-    int sem_caps[9];
-    for (int i=0;i<9;++i) { sem_tables[i][0]=0; sem_caps[i]=16384; }
-
-    /* We will also compute semester-wise averages and SGPA */
-    int sem_subject_counts[9] = {0};
-    int sem_attended_sum[9] = {0};
-    int sem_held_sum[9] = {0};
-    double sem_weighted_sum[9] = {0.0};
-    int sem_credits_sum[9] = {0};
-
-    /* helper local buffers */
-    char sname_esc[256];
-
+    char subject_rows[8192]; subject_rows[0]=0;
+    int maxbars = s->num_subjects;
+    int percentages[MAX_SUBJECTS];
     for (int i = 0; i < s->num_subjects; ++i) {
-        const char *subjname = s->subjects[i].name;
-        int subj_sem = subject_semester(subjname); /* 1..8 or 0 if unknown */
-        if (subj_sem <= 0) subj_sem = 0; /* put unknown into 0 bucket (we will show later) */
-
-        /* determine display marks and attendance: if stored values are zero AND
-           subject belongs to a semester earlier than current_semester, or is current_semester
-           but has no marks, produce deterministic defaults so dashboard shows meaningful data */
-        int disp_marks = s->subjects[i].marks;
         int held = s->subjects[i].classes_held;
         int att = s->subjects[i].classes_attended;
-
-        if ((subj_sem > 0 && subj_sem <= s->current_semester)) {
-            if (disp_marks == 0 || held == 0) {
-                unsigned int h = deterministic_hash(subjname, (unsigned int)s->id ^ (unsigned int)subj_sem);
-                /* For current semester, bias slightly higher to look realistic */
-                if (subj_sem == s->current_semester) {
-                    disp_marks = 50 + (h % 51); /* 50..100 */
-                    held = 6 + (h % 15);        /* 6..20 classes held */
-                    att = (held * (60 + ((h >> 7) % 41))) / 100; /* 60%-100% */
-                } else {
-                    disp_marks = 45 + (h % 46); /* 45..90 */
-                    held = 20 + (h % 21);      /* 20..40 classes held */
-                    att = (held * (50 + ((h >> 8) % 51))) / 100; /* attendance 50%-100% */
-                }
-            }
-        }
-
-        /* prepare escaped subject name */
-        html_escape_buf(subjname, sname_esc, sizeof(sname_esc));
-
-        /* grade point for display */
-        int gp = (s->subjects[i].credits>0)? marks_to_grade_point_local(disp_marks) : 0;
-
-        /* build a row */
+        int pct = (held == 0) ? 0 : (int)(((double)att / held) * 100.0 + 0.5);
+        percentages[i] = pct;
         char row[512];
-        int pct_att = (held==0?0:(int)(((double)att/held)*100.0 + 0.5));
-        snprintf(row, sizeof(row), "<tr><td>%s</td><td>%d</td><td>%d</td><td>%.0f</td><td>%d%%</td></tr>", sname_esc, disp_marks, s->subjects[i].credits, (double)gp, pct_att);
-
-        int semidx = subj_sem;
-        if (semidx < 0 || semidx > 8) semidx = 0;
-        strncat(sem_tables[semidx], row, sizeof(sem_tables[semidx]) - strlen(sem_tables[semidx]) - 1);
-
-        /* accumulate for semester attendance averages and SGPA */
-        if (held > 0) {
-            sem_subject_counts[semidx]++;
-            sem_attended_sum[semidx] += att;
-            sem_held_sum[semidx] += held;
-        }
-        if (s->subjects[i].credits > 0) {
-            sem_weighted_sum[semidx] += (double)marks_to_grade_point_local(disp_marks) * s->subjects[i].credits;
-            sem_credits_sum[semidx] += s->subjects[i].credits;
-        }
+        char sname_esc[256]; html_escape_buf(s->subjects[i].name, sname_esc, sizeof(sname_esc));
+        double gp = (s->subjects[i].credits>0)? marks_to_grade_point_local(s->subjects[i].marks) : 0;
+        snprintf(row, sizeof(row),
+                 "<tr><td>%d</td><td>%s</td><td>%d</td><td>%d</td><td>%.0f</td><td>%d%%</td></tr>",
+                 i+1, sname_esc, s->subjects[i].marks, s->subjects[i].credits, gp, pct);
+        strncat(subject_rows, row, sizeof(subject_rows)-strlen(subject_rows)-1);
     }
-
-    /* Compute per-semester SGPAs and overall CGPA (using semesters up to current_semester)
-       Use deterministic/defaulted marks where real data missing (we already used disp_marks above)
-    */
-    double sem_sgpa[9] = {0.0};
-    int total_credits_all = 0; double total_weighted_all = 0.0;
-    for (int sem = 1; sem <= s->current_semester && sem <= 8; ++sem) {
-        if (sem_credits_sum[sem] > 0) {
-            sem_sgpa[sem] = sem_weighted_sum[sem] / (double)sem_credits_sum[sem];
-            total_weighted_all += sem_weighted_sum[sem];
-            total_credits_all += sem_credits_sum[sem];
-        } else {
-            sem_sgpa[sem] = 0.0;
-        }
-    }
-    double overall_cgpa = (total_credits_all > 0) ? (total_weighted_all / (double)total_credits_all) : s->cgpa;
-
-    /* Build semester-wise attendance SVG (one bar per semester current..1) */
-    int max_sem = s->current_semester;
-    if (max_sem < 1) max_sem = 1;
-    if (max_sem > 8) max_sem = 8;
-    int w = 640, h = 180, pad = 28;
+    double sgpa = compute_sgpa_local(s);
+    /* small inline SVG bar chart */
     char svg[4096]; svg[0]=0;
+    int w = 480, h = 160, pad = 30;
+    int barw = (maxbars>0) ? ( (w - pad*2) / maxbars - 6 ) : 20;
+    if (barw < 8) barw = 8;
     char svg_start[256];
     snprintf(svg_start, sizeof(svg_start), "<svg viewBox='0 0 %d %d' width='%d' height='%d' xmlns='http://www.w3.org/2000/svg'><rect width='100%%' height='100%%' fill='transparent'/>", w, h, w, h);
     strcpy(svg, svg_start);
     snprintf(svg + strlen(svg), sizeof(svg)-strlen(svg), "<line x1='%d' y1='%d' x2='%d' y2='%d' stroke='#eee'/>", pad, h-pad, w-pad, h-pad);
-    int barw = (max_sem>0) ? ((w - pad*2) / max_sem - 8) : 20;
-    if (barw < 8) barw = 8;
-    for (int i = 0; i < max_sem; ++i) {
-        int sem = max_sem - i; /* latest first */
-        int x = pad + i*(barw+8);
-        int pct = 0;
-        if (sem_held_sum[sem] > 0) {
-            pct = (int)((double)sem_attended_sum[sem] / (double)sem_held_sum[sem] * 100.0 + 0.5);
-        } else {
-            unsigned int hsh = deterministic_hash("SEM", (unsigned int)(s->id ^ sem));
-            pct = 55 + (hsh % 41); /* 55..95 */
-        }
-        if (pct > 100) pct = 100;
-        int barh = (pct * (h - pad*2)) / 100;
+    for (int i = 0; i < maxbars; ++i) {
+        int x = pad + i*(barw+6);
+        int barh = (percentages[i] * (h - pad*2)) / 100;
         int y = (h - pad) - barh;
-        snprintf(svg + strlen(svg), sizeof(svg)-strlen(svg), "<rect x='%d' y='%d' width='%d' height='%d' rx='6' ry='6' fill='#3b82f6' opacity='0.85'/>", x, y, barw, barh);
-        snprintf(svg + strlen(svg), sizeof(svg)-strlen(svg), "<text x='%d' y='%d' font-size='11' fill='#111'>Sem %d</text>", x, h-pad+14, sem);
-        snprintf(svg + strlen(svg), sizeof(svg)-strlen(svg), "<text x='%d' y='%d' font-size='11' fill='#111'>%d%%</text>", x, y-4, pct);
+        snprintf(svg + strlen(svg), sizeof(svg)-strlen(svg),
+                 "<rect x='%d' y='%d' width='%d' height='%d' rx='4' ry='4' fill='#3b82f6' opacity='0.85'/>",
+                 x, y, barw, barh);
+        char lbl[64]; html_escape_buf(s->subjects[i].name, lbl, sizeof(lbl));
+        if (strlen(lbl) > 18) lbl[18]='\0';
+        snprintf(svg + strlen(svg), sizeof(svg)-strlen(svg),
+                 "<text x='%d' y='%d' font-size='10' fill='#111'>%s</text>",
+                 x, h-pad+12, lbl);
     }
     strcat(svg, "</svg>");
 
@@ -571,42 +419,22 @@ static char *build_student_dashboard(int idx) {
 
     const char *tpl_end = "<p><a href='/'>← Back to Home</a></p></div></body></html>";
 
-    size_t cap = strlen(tpl_start) + 32768 + strlen(svg) + 4096;
+    size_t cap = strlen(tpl_start) + 4096 + strlen(subject_rows) + strlen(svg) + 1024;
     char *buf = malloc(cap);
     if (!buf) return NULL;
     strcpy(buf, tpl_start);
     char header[512];
     char dept_esc[256]; html_escape_buf(s->dept, dept_esc, sizeof(dept_esc));
-    double sgpa_current = sem_sgpa[s->current_semester];
-    if (sgpa_current == 0.0) sgpa_current = compute_sgpa_local(s); /* fallback */
     snprintf(header, sizeof(header),
              "<h2>Welcome, %s</h2><p>ID: %d | Dept: %s | Year: %d | Semester: %d | Age: %d</p>"
-             "<p><strong>SGPA (current semester %d):</strong> %.3f  &nbsp;&nbsp; <strong>Overall CGPA:</strong> %.3f (Credits: %d)</p>",
-             escaped_name, s->id, dept_esc, s->year, s->current_semester, s->age, s->current_semester, sgpa_current, overall_cgpa, total_credits_all);
+             "<p><strong>SGPA (current):</strong> %.3f  &nbsp;&nbsp; <strong>Stored CGPA:</strong> %.3f (Credits: %d)</p>",
+             escaped_name, s->id, dept_esc, s->year, s->current_semester, s->age, sgpa, s->cgpa, s->total_credits_completed);
     strcat(buf, header);
-    strcat(buf, "<h3>Semester-wise Attendance</h3>");
+    strcat(buf, "<h3>Attendance (per subject)</h3>");
     strcat(buf, svg);
-
-    /* For each semester, render a table, newest first */
-    for (int sem = s->current_semester; sem >= 1 && sem <= 8; --sem) {
-        char semtitle[256]; snprintf(semtitle, sizeof(semtitle), "<h3>Semester %d - SGPA: %.3f</h3>", sem, sem_sgpa[sem]);
-        strcat(buf, semtitle);
-        strcat(buf, "<table><tr><th>Subject</th><th>Marks</th><th>Credits</th><th>GradePoint</th><th>Attendance</th></tr>");
-        if (strlen(sem_tables[sem]) == 0) {
-            strcat(buf, "<tr><td colspan='5'>No subjects recorded for this semester.</td></tr>");
-        } else {
-            strcat(buf, sem_tables[sem]);
-        }
-        strcat(buf, "</table>");
-    }
-
-    /* Unknown/other subjects (extras) */
-    if (strlen(sem_tables[0]) > 0) {
-        strcat(buf, "<h3>Other Subjects</h3><table><tr><th>Subject</th><th>Marks</th><th>Credits</th><th>GradePoint</th><th>Attendance</th></tr>");
-        strcat(buf, sem_tables[0]);
-        strcat(buf, "</table>");
-    }
-
+    strcat(buf, "<h3>Subjects & Marks</h3><table><tr><th>#</th><th>Subject</th><th>Marks</th><th>Credits</th><th>GradePoint</th><th>Attendance</th></tr>");
+    strcat(buf, subject_rows);
+    strcat(buf, "</table>");
     strcat(buf, tpl_end);
     return buf;
 }
@@ -670,32 +498,23 @@ static void handle_client(int client) {
             close(client); return;
         }
         if (strncmp(path, "/attendance", 10) == 0) {
-            /* show form to mark attendance for a subject (admin-only page)
-               new flow:
-               - GET /attendance -> show semester select
-               - GET /attendance?semester=N -> show subjects in that semester
-               - GET /attendance?semester=N&subject=Name -> show students with checkboxes
-            */
+            /* show form to mark attendance for a subject (admin-only page) */
+            /* Expects query ?subject=... optionally */
             char *q = strchr(fullpath, '?');
-            int sem = 0;
             char subject_q[256] = {0};
             if (q) {
                 char *qs = strdup(q+1);
-                char *ssem = form_value(qs, "semester");
                 char *sub = form_value(qs, "subject");
-                if (ssem) { sem = atoi(ssem); free(ssem); }
                 if (sub) { strncpy(subject_q, sub, sizeof(subject_q)-1); free(sub); }
                 free(qs);
             }
-            /* gather unique subjects per semester (or all if sem==0) */
-            char subjects[16384]; subjects[0]=0;
+            /* build form: choose subject (unique subjects across students), then list students who have it */
+            /* gather unique subjects */
+            char subjects[8192]; subjects[0]=0;
             for (int i=0;i<student_count;++i) {
                 if (!students[i].exists) continue;
                 for (int j=0;j<students[i].num_subjects;++j) {
                     char *sname = students[i].subjects[j].name;
-                    int ssem = subject_semester(sname);
-                    if (sem != 0 && ssem != sem) continue;
-                    /* avoid duplicates */
                     if (strstr(subjects, sname)==NULL) {
                         if (strlen(subjects)+strlen(sname)+16 > sizeof(subjects)) continue;
                         strcat(subjects, sname);
@@ -703,46 +522,29 @@ static void handle_client(int client) {
                     }
                 }
             }
-            size_t cap = 32768;
+            /* build HTML */
+            size_t cap = 16384;
             char *buf = malloc(cap);
             if (!buf) { send_text(client, "500 Internal Server Error", "text/plain", "Server error"); close(client); return; }
             strcpy(buf, "<!doctype html><html><head><meta charset='utf-8'><title>Attendance</title></head><body><h2>Admin Attendance</h2>");
-            /* Semester selection form */
-            strcat(buf, "<form method='get' action='/attendance'>Select semester: <select name='semester'>");
-            for (int s=1;s<=8;++s) {
-                char opt[64];
-                snprintf(opt, sizeof(opt), "<option value='%d'%s>Semester %d</option>", s, (s==sem) ? " selected" : "", s);
-                strcat(buf, opt);
+            strcat(buf, "<form method='get' action='/attendance'>Choose subject: <select name='subject'>");
+            /* add options */
+            char *subjects_copy = strdup(subjects);
+            char *line = strtok(subjects_copy, "\n");
+            while (line) {
+                char esc[256]; html_escape_buf(line, esc, sizeof(esc));
+                char option[512];
+                snprintf(option, sizeof(option), "<option value=\"%s\"%s>%s</option>", esc, (strcmp(esc, subject_q)==0) ? " selected" : "", esc);
+                if (strlen(buf)+strlen(option)+256 > cap) { cap*=2; buf=realloc(buf,cap); }
+                strcat(buf, option);
+                line = strtok(NULL, "\n");
             }
-            strcat(buf, "</select> <button>Choose</button></form><hr>");
-            /* If semester selected but subject not, list subjects as clickable items or radio list */
-            if (sem != 0 && subject_q[0] == 0) {
-                strcat(buf, "<h3>Subjects in chosen semester</h3>");
-                if (strlen(subjects)==0) {
-                    strcat(buf, "<p>No subjects found for this semester.</p>");
-                } else {
-                    strcat(buf, "<form method='get' action='/attendance'>");
-                    char hidden[64];
-                    snprintf(hidden, sizeof(hidden), "<input type='hidden' name='semester' value='%d'/>", sem);
-                    strcat(buf, hidden);
-                    strcat(buf, "<ul>");
-                    char *copy = strdup(subjects);
-                    char *line = strtok(copy, "\n");
-                    while (line) {
-                        char esc[256]; html_escape_buf(line, esc, sizeof(esc));
-                        char li[512];
-                        snprintf(li, sizeof(li), "<li><label><input type='radio' name='subject' value=\"%s\" required/> %s</label></li>", esc, esc);
-                        strcat(buf, li);
-                        line = strtok(NULL, "\n");
-                    }
-                    free(copy);
-                    strcat(buf, "</ul><div style='margin-top:8px'><button>Open Subject</button></div></form>");
-                }
-            }
-            /* If subject selected, show student list with checkboxes */
+            free(subjects_copy);
+            strcat(buf, "</select><button>Open</button></form>");
             if (subject_q[0]) {
-                char panel[16384]; panel[0]=0;
-                snprintf(panel, sizeof(panel), "<h3>Subject: %s (Semester %d)</h3><form method='post' action='/attendance'><input type='hidden' name='subject' value='%s'/>Date (YYYY-MM-DD): <input name='date' value='", subject_q, sem, subject_q);
+                /* show list of students with checkboxes for this subject */
+                char panel[8192]; panel[0]=0;
+                snprintf(panel, sizeof(panel), "<h3>Subject: %s</h3><form method='post' action='/attendance'><input type='hidden' name='subject' value='%s'/>Date (YYYY-MM-DD): <input name='date' value='", subject_q, subject_q);
                 time_t t = time(NULL); struct tm tm = *localtime(&t); char datebuf[32];
                 snprintf(datebuf, sizeof(datebuf), "%04d-%02d-%02d", tm.tm_year+1900, tm.tm_mon+1, tm.tm_mday);
                 strncat(panel, datebuf, sizeof(panel)-strlen(panel)-1);
@@ -762,55 +564,6 @@ static void handle_client(int client) {
                 strcat(buf, panel);
             }
             strcat(buf, "<p><a href='/'>Back</a></p></body></html>");
-            send_text(client, "200 OK", "text/html; charset=utf-8", buf);
-            free(buf);
-            close(client); return;
-        }
-
-        if (strncmp(path, "/enter-marks", 12) == 0) {
-            /* GET /enter-marks?id=<id> -> show table of student's current semester subjects with mark inputs */
-            char *q = strchr(fullpath, '?');
-            int id = -1;
-            if (q) {
-                char *qs = strdup(q+1);
-                char *vid = form_value(qs, "id");
-                if (vid) { id = atoi(vid); free(vid); }
-                free(qs);
-            }
-            if (id <= 0) {
-                /* render a small page explaining how to use this endpoint */
-                const char *help = "<!doctype html><html><head><meta charset='utf-8'><title>Enter Marks</title></head><body><h3>Enter Marks</h3><p>Provide a student ID on the admin dashboard or use the dashboard form.</p><p><a href='/'>Back</a></p></body></html>";
-                send_text(client, "200 OK", "text/html; charset=utf-8", help);
-                close(client); return;
-            }
-            int idx = api_find_index_by_id(id);
-            if (idx == -1) { send_text(client, "404 Not Found", "text/plain", "Student not found"); close(client); return; }
-            Student *s = &students[idx];
-            /* Build form: table of subjects that belong to current_semester */
-            int cur = s->current_semester;
-            size_t cap = 16384;
-            char *buf = malloc(cap);
-            if (!buf) { send_text(client, "500 Internal Server Error", "text/plain", "Server error"); close(client); return; }
-            snprintf(buf, cap, "<!doctype html><html><head><meta charset='utf-8'><title>Enter Marks for %s</title></head><body><h2>Enter Marks for %s (ID: %d) - Semester %d</h2>", s->name, s->name, s->id, cur);
-            strcat(buf, "<form method='post' action='/enter-marks'>");
-            char hid[64]; snprintf(hid, sizeof(hid), "<input type='hidden' name='id' value='%d'/>", s->id); strcat(buf, hid);
-            strcat(buf, "<table border='1' cellpadding='6'><tr><th>#</th><th>Subject</th><th>Credits</th><th>Marks (0-100)</th></tr>");
-            int shown = 0;
-            for (int i=0;i<s->num_subjects;++i) {
-                int sem = subject_semester(s->subjects[i].name);
-                if (sem != cur) continue;
-                shown++;
-                char subj_esc[256]; html_escape_buf(s->subjects[i].name, subj_esc, sizeof(subj_esc));
-                char row[512];
-                /* input name uses the subject array index so POST can map back */
-                snprintf(row, sizeof(row), "<tr><td>%d</td><td>%s</td><td>%d</td><td><input name='mark_%d' value='%d' size='4' /></td></tr>", shown, subj_esc, s->subjects[i].credits, i, s->subjects[i].marks);
-                if (strlen(buf)+strlen(row)+256 > cap) { cap*=2; buf=realloc(buf,cap); }
-                strcat(buf, row);
-            }
-            if (shown == 0) {
-                strcat(buf, "<tr><td colspan='4'>No subjects for current semester.</td></tr>");
-            }
-            strcat(buf, "</table><div style='margin-top:8px'><button>Submit Marks</button></div></form><p><a href='/'>Back</a></p></body></html>");
             send_text(client, "200 OK", "text/html; charset=utf-8", buf);
             free(buf);
             close(client); return;
@@ -835,113 +588,184 @@ static void handle_client(int client) {
             int ok = api_admin_auth(user, pass); /* uses student_system.c auth */
             free(user); free(pass);
             if (!ok) { send_text(client, "401 Unauthorized", "text/plain", "Invalid admin credentials"); close(client); return; }
-            /* admin dashboard: updated flows for attendance and marks */
+            /* admin dashboard: removed add student & generate report per request */
             const char *adm =
               "<!doctype html><html><head><meta charset='utf-8'><title>Admin Dashboard</title>"
               "<style>body{font-family:Arial;margin:18px} .card{max-width:900px;padding:18px;border-radius:10px;background:#fff;border:1px solid #eee} input,button,textarea,select{padding:8px;margin:6px 0;width:100%} button{background:#0b69ff;color:#fff;border:none;border-radius:6px}</style></head><body>"
               "<div class='card'><h2>Admin Dashboard</h2>"
               "<p>Manage marks and attendance.</p>"
               "<h3>View all students</h3><p><a href='/list'>Open students list</a></p>"
-              "<h3>Enter marks for a student</h3>"
-              "<p>Step 1: Enter Student ID and click <em>Load Subjects</em>. The student's current semester subjects will be shown.</p>"
-              "<form method='get' action='/enter-marks' style='max-width:420px'>"
+              "<h3>Enter marks for a student (by subject name)</h3>"
+              "<form method='post' action='/enter-marks'>"
               "<input name='id' placeholder='Student ID' required />"
-              "<div style='margin-top:8px'><button>Load Subjects</button></div></form>"
-              "<h3>Mark attendance</h3>"
-              "<p>Step 1: Select semester. Step 2: Select subject. Step 3: Mark attendance for students.</p>"
-              "<form method='get' action='/attendance' style='max-width:420px'><select name='semester'>"
-              "<option value='1'>Semester 1</option><option value='2'>Semester 2</option><option value='3'>Semester 3</option><option value='4'>Semester 4</option>"
-              "<option value='5'>Semester 5</option><option value='6'>Semester 6</option><option value='7'>Semester 7</option><option value='8'>Semester 8</option>"
-              "</select><div style='margin-top:8px'><button>Select Semester</button></div></form>"
+              "<textarea name='marks' rows='8' placeholder='Format: Subject Name|marks\\nOne subject per line'></textarea>"
+              "<div style='margin-top:8px'><button>Submit marks</button></div></form>"
+              "<h3>Mark attendance for a subject</h3>"
+              "<form method='get' action='/attendance'><input name='subject' placeholder='Subject name (exact)'/> <button>Open</button></form>"
               "<p><a href='/'>Back</a></p></div></body></html>";
             send_text(client, "200 OK", "text/html; charset=utf-8", adm);
             close(client); return;
         }
 
-        /* Enter marks (admin) - supports both old textarea format and new table format */
-        if (strncmp(path, "/enter-marks", 12) == 0) {
-            char *id_s = form_value(body, "id");
-            char *marks = form_value(body, "marks"); /* old format support */
-            if (!id_s && !marks) {
-                /* possibly new table format - try to find mark_* fields by scanning body */
-                /* naive parser: find 'mark_<idx>=' occurrences */
-                const char *p = body;
-                int any_found = 0;
-                int sid = -1;
-                char *sidv = form_value(body, "id");
-                if (sidv) { sid = atoi(sidv); free(sidv); }
-                if (sid <= 0) { send_text(client, "400 Bad Request", "text/plain", "Missing student id"); close(client); return; }
-                int idx = api_find_index_by_id(sid);
-                if (idx == -1) { send_text(client, "404 Not Found", "text/plain", "Student not found"); close(client); return; }
-                while ((p = strstr(p, "mark_")) != NULL) {
-                    p += strlen("mark_");
-                    /* read index */
-                    int idnum = atoi(p);
-                    /* find '=' */
-                    const char *eq = strchr(p, '=');
-                    if (!eq) break;
-                    eq++;
-                    /* read value until & or end */
-                    char valbuf[64]; int vi=0;
-                    while (*eq && *eq != '&' && vi < (int)sizeof(valbuf)-1) { valbuf[vi++]=*eq++; }
-                    valbuf[vi]=0;
-                    char *dec = strdup(valbuf); urldecode_inplace(dec);
-                    int mk = atoi(dec);
-                    free(dec);
-                    if (idnum >= 0 && idnum < students[idx].num_subjects) {
-                        students[idx].subjects[idnum].marks = mk;
-                        any_found = 1;
-                    }
-                }
-                if (!any_found) { send_text(client, "400 Bad Request", "text/plain", "No marks found"); close(client); return; }
-                api_calculate_update_cgpa(idx);
+        /* Student sign-up */
+        if (strncmp(path, "/student-signup", 16) == 0) {
+            char *name = form_value(body, "name");
+            char *age = form_value(body, "age");
+            char *sap = form_value(body, "sap_id");
+            char *password = form_value(body, "password");
+            char *email = form_value(body, "email");
+            char *phone = form_value(body, "phone");
+            char *semester = form_value(body, "semester");
+            if (!name || !age || !sap || !password || !email || !phone || !semester) {
+                send_text(client, "400 Bad Request", "text/plain", "Missing fields");
+                goto signup_cleanup;
+            }
+            int sapid = atoi(sap);
+            int sem = atoi(semester);
+            if (sapid <= 0 || sem < 1 || sem > 8) {
                 char resp[256];
-                snprintf(resp, sizeof(resp), "<p>Marks updated for ID %d (table format). <a href='/'>Back</a></p>", sid);
-                send_text(client, "200 OK", "text/html; charset=utf-8", resp);
-                close(client); return;
+                snprintf(resp, sizeof(resp),
+                    "<!doctype html><html><body><p>Invalid SAP ID or semester provided.</p><p><a href='/'>Back</a></p></body></html>");
+                send_text(client, "400 Bad Request", "text/html; charset=utf-8", resp);
+                goto signup_cleanup;
+            }
+            Student s; memset(&s, 0, sizeof(s));
+            s.exists = 1; s.cgpa = 0.0; s.total_credits_completed = 0;
+            s.id = sapid;
+            strncpy(s.name, name, sizeof(s.name)-1); s.name[sizeof(s.name)-1]=0;
+            s.age = atoi(age);
+            strncpy(s.email, email, sizeof(s.email)-1); s.email[sizeof(s.email)-1]=0;
+            strncpy(s.phone, phone, sizeof(s.phone)-1); s.phone[sizeof(s.phone)-1]=0;
+            strncpy(s.dept, "B.Tech CSE", sizeof(s.dept)-1); s.dept[sizeof(s.dept)-1]=0;
+            s.year = 1;
+            s.current_semester = sem;
+            s.num_subjects = 0;
+            strncpy(s.password, password, sizeof(s.password)-1); s.password[sizeof(s.password)-1]=0;
+
+            /* Default semester subjects arrays */
+            const char *sem1[] = {
+                "Programming in C","Linux Lab","Problem Solving","Advanced Engineering Mathematics - I","Physics for Computer Engineers","Managing Self","Environmental Sustainability and Climate Change", NULL
+            };
+            const int sem1_c[] = {5,2,2,4,5,2,2};
+            const char *sem2[] = {
+                "Data Structures and Algorithms","Digital Electronics","Python Programming","Advanced Engineering Mathematics - II","Environmental Sustainability and Climate Change","Time and Priority Management","Elements of AI/ML", NULL
+            };
+            const int sem2_c[] = {5,3,5,4,2,2,3};
+            const char *sem3[] = {
+                "Leading Conversations","Discrete Mathematical Structures","Operating Systems","Elements of AI/ML","Database Management Systems","Design and Analysis of Algorithms", NULL
+            };
+            const int sem3_c[] = {2,3,3,3,5,4};
+            const char *sem4[] = {
+                "Software Engineering","EDGE - Soft Skills","Linear Algebra","Indian Constitution","Writing with Impact","Object Oriented Programming","Data Communication and Networks","Applied Machine Learning", NULL
+            };
+            const int sem4_c[] = {3,0,3,0,2,4,4,5};
+            const char *sem5[] = {
+                "Cryptography and Network Security","Formal Languages and Automata Theory","Object Oriented Analysis and Design","Exploratory-3","Start your Startup","Research Methodology in CS","Probability, Entropy, and MC Simulation","PE-2","PE-2 Lab", NULL
+            };
+            const int sem5_c[] = {3,3,3,3,2,3,3,4,1};
+            const char *sem6[] = {
+                "Exploratory-4","Leadership and Teamwork","Compiler Design","Statistics and Data Analysis","PE-3","PE-3 Lab","Minor Project", NULL
+            };
+            const int sem6_c[] = {3,2,3,3,4,1,5};
+            const char *sem7[] = {
+                "Exploratory-5","PE-4","PE-4 Lab","PE-5","PE-5 Lab","Capstone Project - Phase-1","Summer Internship", NULL
+            };
+            const int sem7_c[] = {3,4,1,3,1,5,1};
+            const char *sem8[] = {
+                "IT Ethical Practices","Capstone Project - Phase-2", NULL
+            };
+            const int sem8_c[] = {3,5};
+
+            for (int cur=1; cur<=sem; ++cur) {
+                if (cur==1) add_subjects_to_student(&s, sem1, sem1_c);
+                else if (cur==2) add_subjects_to_student(&s, sem2, sem2_c);
+                else if (cur==3) add_subjects_to_student(&s, sem3, sem3_c);
+                else if (cur==4) add_subjects_to_student(&s, sem4, sem4_c);
+                else if (cur==5) add_subjects_to_student(&s, sem5, sem5_c);
+                else if (cur==6) add_subjects_to_student(&s, sem6, sem6_c);
+                else if (cur==7) add_subjects_to_student(&s, sem7, sem7_c);
+                else if (cur==8) add_subjects_to_student(&s, sem8, sem8_c);
             }
 
-            /* legacy textarea mode */
-            if (id_s && marks) {
-                int sid = atoi(id_s);
-                free(id_s);
-                int idx = api_find_index_by_id(sid);
-                if (idx == -1) {
-                    send_text(client, "404 Not Found", "text/plain", "Student not found");
-                    free(marks); close(client); return;
-                }
-                /* parse lines */
-                char *line = strtok(marks, "\n");
-                int updated = 0;
-                while (line) {
-                    /* trim */
-                    while (*line == ' ' || *line == '\r' || *line == '\t') line++;
-                    char *sep = strstr(line, "|");
-                    if (sep) {
-                        *sep = 0;
-                        char *subj = line;
-                        char *mstr = sep + 1;
-                        while (*mstr==' ') mstr++;
-                        int mk = atoi(mstr);
-                        if (mk < 0) mk = 0;
-                        /* find subject by exact name and set marks */
-                        for (int i=0;i<students[idx].num_subjects;++i) {
-                            if (strcmp(students[idx].subjects[i].name, subj)==0) {
-                                students[idx].subjects[i].marks = mk;
-                                updated++;
-                                break;
-                            }
-                        }
-                    }
-                    line = strtok(NULL, "\n");
-                }
-                free(marks);
-                api_calculate_update_cgpa(idx);
+            /* Save via API */
+            int addres = api_add_student(&s);
+            if (addres == -2) {
                 char resp[256];
-                snprintf(resp, sizeof(resp), "<p>Marks updated for ID %d (%d subjects updated). <a href='/'>Back</a></p>", sid, updated);
+                snprintf(resp, sizeof(resp),
+                    "<!doctype html><html><body><p>SAP ID %d already registered. Try signing in.</p><p><a href='/'>Back</a></p></body></html>",
+                    s.id);
+                send_text(client, "409 Conflict", "text/html; charset=utf-8", resp);
+            } else if (addres <= 0) {
+                send_text(client, "500 Internal Server Error", "text/plain", "Unable to register");
+            } else {
+                char resp[512];
+                snprintf(resp, sizeof(resp),
+                    "<!doctype html><html><body><p>Registration successful!</p>"
+                    "<p>Your Student ID (SAP ID): <strong>%d</strong></p>"
+                    "<p>Default subjects for semester %d and earlier have been added automatically.</p>"
+                    "<p><a href='/'>Back to Home</a></p></body></html>", addres, sem);
                 send_text(client, "200 OK", "text/html; charset=utf-8", resp);
+            }
+
+        signup_cleanup:
+            if (name) free(name);
+            if (age) free(age);
+            if (sap) free(sap);
+            if (password) free(password);
+            if (email) free(email);
+            if (phone) free(phone);
+            if (semester) free(semester);
+            close(client); return;
+        }
+
+        /* Enter marks (admin) */
+        if (strncmp(path, "/enter-marks", 12) == 0) {
+            char *id_s = form_value(body, "id");
+            char *marks = form_value(body, "marks");
+            if (!id_s || !marks) {
+                send_text(client, "400 Bad Request", "text/plain", "Missing id or marks");
+                if (id_s) free(id_s);
+                if (marks) free(marks);
                 close(client); return;
             }
+            int sid = atoi(id_s);
+            free(id_s);
+            int idx = api_find_index_by_id(sid);
+            if (idx == -1) {
+                send_text(client, "404 Not Found", "text/plain", "Student not found");
+                free(marks); close(client); return;
+            }
+            /* parse lines */
+            char *line = strtok(marks, "\n");
+            int updated = 0;
+            while (line) {
+                /* trim */
+                while (*line == ' ' || *line == '\r' || *line == '\t') line++;
+                char *sep = strstr(line, "|");
+                if (sep) {
+                    *sep = 0;
+                    char *subj = line;
+                    char *mstr = sep + 1;
+                    while (*mstr==' ') mstr++;
+                    int mk = atoi(mstr);
+                    if (mk < 0) mk = 0;
+                    /* find subject by exact name and set marks */
+                    for (int i=0;i<students[idx].num_subjects;++i) {
+                        if (strcmp(students[idx].subjects[i].name, subj)==0) {
+                            students[idx].subjects[i].marks = mk;
+                            updated++;
+                            break;
+                        }
+                    }
+                }
+                line = strtok(NULL, "\n");
+            }
+            free(marks);
+            api_calculate_update_cgpa(idx);
+            char resp[256];
+            snprintf(resp, sizeof(resp), "<p>Marks updated for ID %d (%d subjects updated). <a href='/'>Back</a></p>", sid, updated);
+            send_text(client, "200 OK", "text/html; charset=utf-8", resp);
+            close(client); return;
         }
 
         /* Attendance POST (admin) */
