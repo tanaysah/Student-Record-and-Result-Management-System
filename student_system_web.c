@@ -1,7 +1,8 @@
 /* student_system_web.c
    Web wrapper for student_system.c
-   - Updated: robust signup route, semester-filtered attendance & marks display,
-     attendance POST marks only students in selected semester.
+   - Updated: fix enter-marks POST handling (table-based), improved student dashboard:
+     groups by semester with latest semester on top, shows current-semester SGPA and marks,
+     and shows stored CGPA.
    Compile:
      gcc -DBUILD_WEB student_system.c student_system_web.c -o student_system_web
 */
@@ -411,77 +412,92 @@ static char *build_list_html(void) {
     return buf;
 }
 
-/* build student dashboard as HTML (groups by semester; default deterministic display used if needed)
-   (unchanged here, it's not the core of the bug you reported)
-*/
+/* build student dashboard as HTML with attendance & marks grouped by semester (latest on top) */
 static char *build_student_dashboard(int idx) {
     if (idx < 0 || idx >= student_count) return NULL;
     Student *s = &students[idx];
     char escaped_name[256]; html_escape_buf(s->name, escaped_name, sizeof(escaped_name));
-    char subject_rows[8192]; subject_rows[0]=0;
-    int maxbars = s->num_subjects;
-    int percentages[MAX_SUBJECTS];
+
+    /* Organize subjects by semester */
+    /* We'll create a simple buffer per semester */
+    char sem_bufs[9][8192];
+    for (int i=0;i<9;++i) sem_bufs[i][0]=0;
     for (int i = 0; i < s->num_subjects; ++i) {
+        int sem = subject_semester(s->subjects[i].name);
+        if (sem < 1 || sem > 8) sem = 0; /* unknown => group 0 (we'll show later) */
+        char sname_esc[256]; html_escape_buf(s->subjects[i].name, sname_esc, sizeof(sname_esc));
         int held = s->subjects[i].classes_held;
         int att = s->subjects[i].classes_attended;
         int pct = (held == 0) ? 0 : (int)(((double)att / held) * 100.0 + 0.5);
-        percentages[i] = pct;
+        int marks = s->subjects[i].marks;
+        double gp = (s->subjects[i].credits>0)? marks_to_grade_point_local(marks) : 0;
         char row[512];
-        char sname_esc[256]; html_escape_buf(s->subjects[i].name, sname_esc, sizeof(sname_esc));
-        double gp = (s->subjects[i].credits>0)? marks_to_grade_point_local(s->subjects[i].marks) : 0;
-        snprintf(row, sizeof(row),
-                 "<tr><td>%d</td><td>%s</td><td>%d</td><td>%d</td><td>%.0f</td><td>%d%%</td></tr>",
-                 i+1, sname_esc, s->subjects[i].marks, s->subjects[i].credits, gp, pct);
-        strncat(subject_rows, row, sizeof(subject_rows)-strlen(subject_rows)-1);
+        snprintf(row, sizeof(row), "<tr><td>%s</td><td>%d</td><td>%d</td><td>%.0f</td><td>%d%%</td></tr>", sname_esc, s->subjects[i].credits, marks, gp, pct);
+        if (sem >=1 && sem <=8) {
+            if (strlen(sem_bufs[sem]) + strlen(row) + 256 > sizeof(sem_bufs[sem])) continue;
+            strcat(sem_bufs[sem], row);
+        } else {
+            if (strlen(sem_bufs[0]) + strlen(row) + 256 > sizeof(sem_bufs[0])) continue;
+            strcat(sem_bufs[0], row);
+        }
     }
-    double sgpa = compute_sgpa_local(s);
-    char svg[4096]; svg[0]=0;
-    int w = 480, h = 160, pad = 30;
-    int barw = (maxbars>0) ? ( (w - pad*2) / maxbars - 6 ) : 20;
-    if (barw < 8) barw = 8;
-    char svg_start[256];
-    snprintf(svg_start, sizeof(svg_start), "<svg viewBox='0 0 %d %d' width='%d' height='%d' xmlns='http://www.w3.org/2000/svg'><rect width='100%%' height='100%%' fill='transparent'/>", w, h, w, h);
-    strcpy(svg, svg_start);
-    snprintf(svg + strlen(svg), sizeof(svg)-strlen(svg), "<line x1='%d' y1='%d' x2='%d' y2='%d' stroke='#eee'/>", pad, h-pad, w-pad, h-pad);
-    for (int i = 0; i < maxbars; ++i) {
-        int x = pad + i*(barw+6);
-        int barh = (percentages[i] * (h - pad*2)) / 100;
-        int y = (h - pad) - barh;
-        snprintf(svg + strlen(svg), sizeof(svg)-strlen(svg),
-                 "<rect x='%d' y='%d' width='%d' height='%d' rx='4' ry='4' fill='#3b82f6' opacity='0.85'/>",
-                 x, y, barw, barh);
-        char lbl[64]; html_escape_buf(s->subjects[i].name, lbl, sizeof(lbl));
-        if (strlen(lbl) > 18) lbl[18]='\0';
-        snprintf(svg + strlen(svg), sizeof(svg)-strlen(svg),
-                 "<text x='%d' y='%d' font-size='10' fill='#111'>%s</text>",
-                 x, h-pad+12, lbl);
+
+    /* compute SGPA for current semester only */
+    double sgpa_current = 0.0;
+    int tot_cr = 0;
+    double weighted = 0.0;
+    for (int i=0;i<s->num_subjects;++i) {
+        int sem = subject_semester(s->subjects[i].name);
+        if (sem != s->current_semester) continue;
+        int cr = s->subjects[i].credits;
+        if (cr <= 0) continue;
+        int mk = s->subjects[i].marks;
+        int gp = marks_to_grade_point_local(mk);
+        weighted += (double)gp * cr;
+        tot_cr += cr;
     }
-    strcat(svg, "</svg>");
+    if (tot_cr > 0) sgpa_current = weighted / (double)tot_cr;
 
     const char *tpl_start =
         "<!doctype html><html><head><meta charset='utf-8'><title>Dashboard</title>"
         "<meta name='viewport' content='width=device-width,initial-scale=1'/>"
-        "<style>body{font-family:Inter,Arial;margin:18px} .card{background:#fff;padding:18px;border-radius:10px;box-shadow:0 6px 18px rgba(0,0,0,0.06);max-width:1000px;margin:auto} table{width:100%;border-collapse:collapse} table th,table td{padding:8px;border:1px solid #eee;text-align:left;font-size:14px}</style>"
+        "<style>body{font-family:Inter,Arial;margin:18px} .card{background:#fff;padding:18px;border-radius:10px;box-shadow:0 6px 18px rgba(0,0,0,0.06);max-width:1000px;margin:auto} table{width:100%;border-collapse:collapse} table th,table td{padding:8px;border:1px solid #eee;text-align:left;font-size:14px} h3.sem{margin-top:18px}</style>"
         "</head><body><div class='card'>";
 
     const char *tpl_end = "<p><a href='/'>← Back to Home</a></p></div></body></html>";
 
-    size_t cap = strlen(tpl_start) + 4096 + strlen(subject_rows) + strlen(svg) + 1024;
+    size_t cap = strlen(tpl_start) + 32768;
     char *buf = malloc(cap);
     if (!buf) return NULL;
     strcpy(buf, tpl_start);
-    char header[512];
+    char header[1024];
     char dept_esc[256]; html_escape_buf(s->dept, dept_esc, sizeof(dept_esc));
     snprintf(header, sizeof(header),
-             "<h2>Welcome, %s</h2><p>ID: %d | Dept: %s | Year: %d | Semester: %d | Age: %d</p>"
-             "<p><strong>SGPA (current):</strong> %.3f  &nbsp;&nbsp; <strong>Stored CGPA:</strong> %.3f (Credits: %d)</p>",
-             escaped_name, s->id, dept_esc, s->year, s->current_semester, s->age, sgpa, s->cgpa, s->total_credits_completed);
+             "<h2>Welcome, %s</h2><p>ID: %d | Dept: %s | Year: %d | Current Semester: %d | Age: %d</p>"
+             "<p><strong>SGPA (current sem %d):</strong> %.3f  &nbsp;&nbsp; <strong>Stored CGPA:</strong> %.3f (Credits: %d)</p>",
+             escaped_name, s->id, dept_esc, s->year, s->current_semester, s->age, s->current_semester, sgpa_current, s->cgpa, s->total_credits_completed);
     strcat(buf, header);
-    strcat(buf, "<h3>Attendance (per subject)</h3>");
-    strcat(buf, svg);
-    strcat(buf, "<h3>Subjects & Marks</h3><table><tr><th>#</th><th>Subject</th><th>Marks</th><th>Credits</th><th>GradePoint</th><th>Attendance</th></tr>");
-    strcat(buf, subject_rows);
-    strcat(buf, "</table>");
+
+    /* Show current semester subjects first */
+    for (int sem = s->current_semester; sem >= 1; --sem) {
+        char title[128];
+        snprintf(title, sizeof(title), "<h3 class='sem'>Semester %d</h3>", sem);
+        strcat(buf, title);
+        strcat(buf, "<table><tr><th>Subject</th><th>Credits</th><th>Marks</th><th>GradePoint</th><th>Attendance</th></tr>");
+        if (sem_bufs[sem][0] == '\0') {
+            strcat(buf, "<tr><td colspan='5'>No subjects for this semester.</td></tr>");
+        } else {
+            strcat(buf, sem_bufs[sem]);
+        }
+        strcat(buf, "</table>");
+    }
+    /* Show unknown-grouped subjects (if any) */
+    if (sem_bufs[0][0]) {
+        strcat(buf, "<h3 class='sem'>Other / Uncategorized Subjects</h3><table><tr><th>Subject</th><th>Credits</th><th>Marks</th><th>GradePoint</th><th>Attendance</th></tr>");
+        strcat(buf, sem_bufs[0]);
+        strcat(buf, "</table>");
+    }
+
     strcat(buf, tpl_end);
     return buf;
 }
@@ -847,23 +863,40 @@ static void handle_client(int client) {
             close(client); return;
         }
 
-        /* Enter marks (admin) - supports new table format and legacy textarea */
+        /* Enter marks (admin) - supports table-based (mark_<index>) and legacy textarea */
         if (strncmp(path, "/enter-marks", strlen("/enter-marks")) == 0) {
+            /* Try to get student id first (hidden field) */
             char *id_s = form_value(body, "id");
-            char *marks = form_value(body, "marks"); /* legacy textarea */
-            if (!id_s && !marks) {
-                /* try table-based mark_* parsing */
-                const char *p = body;
-                int sid = -1;
-                char *sidv = form_value(body, "id");
-                if (sidv) { sid = atoi(sidv); free(sidv); }
-                if (sid <= 0) { send_text(client, "400 Bad Request", "text/plain", "Missing student id"); close(client); return; }
+            char *marks_txt = form_value(body, "marks"); /* legacy textarea */
+            if (!id_s && !marks_txt) {
+                send_text(client, "400 Bad Request", "text/plain", "Missing id/marks");
+                if (id_s) free(id_s);
+                if (marks_txt) free(marks_txt);
+                close(client); return;
+            }
+
+            /* If id provided, prefer table-format parsing (mark_<index>=val) */
+            if (id_s) {
+                int sid = atoi(id_s);
+                free(id_s);
+                if (sid <= 0) {
+                    send_text(client, "400 Bad Request", "text/plain", "Invalid student id");
+                    if (marks_txt) free(marks_txt);
+                    close(client); return;
+                }
                 int idx = api_find_index_by_id(sid);
-                if (idx == -1) { send_text(client, "404 Not Found", "text/plain", "Student not found"); close(client); return; }
+                if (idx == -1) {
+                    send_text(client, "404 Not Found", "text/plain", "Student not found");
+                    if (marks_txt) free(marks_txt);
+                    close(client); return;
+                }
                 int any_found = 0;
+                /* scan for occurrences of "mark_" in the raw body and extract index and value */
+                const char *p = body;
                 while ((p = strstr(p, "mark_")) != NULL) {
                     p += strlen("mark_");
                     int idnum = atoi(p);
+                    /* find '=' following the number */
                     const char *eq = strchr(p, '=');
                     if (!eq) break;
                     eq++;
@@ -878,56 +911,59 @@ static void handle_client(int client) {
                         any_found = 1;
                     }
                 }
-                if (!any_found) { send_text(client, "400 Bad Request", "text/plain", "No marks found"); close(client); return; }
+                /* fallback: if no mark_* fields but a legacy textarea exists, parse it */
+                if (!any_found && marks_txt) {
+                    char *line = strtok(marks_txt, "\n");
+                    int updated = 0;
+                    while (line) {
+                        while (*line == ' ' || *line == '\r' || *line == '\t') line++;
+                        char *sep = strstr(line, "|");
+                        if (sep) {
+                            *sep = 0;
+                            char *subj = line;
+                            char *mstr = sep + 1;
+                            while (*mstr==' ') mstr++;
+                            int mk = atoi(mstr);
+                            if (mk < 0) mk = 0;
+                            /* find subject by exact name and set marks */
+                            for (int i=0;i<students[idx].num_subjects;++i) {
+                                if (strcmp(students[idx].subjects[i].name, subj)==0) {
+                                    students[idx].subjects[i].marks = mk;
+                                    updated++;
+                                    break;
+                                }
+                            }
+                        }
+                        line = strtok(NULL, "\n");
+                    }
+                    any_found = (updated > 0);
+                }
+                if (!any_found) {
+                    send_text(client, "400 Bad Request", "text/plain", "No marks found in submission");
+                    if (marks_txt) free(marks_txt);
+                    close(client); return;
+                }
+                /* Recalculate CGPA via API and save */
                 api_calculate_update_cgpa(idx);
+                save_data();
                 char resp[256];
-                snprintf(resp, sizeof(resp), "<p>Marks updated for ID %d (table format). <a href='/'>Back</a></p>", sid);
+                snprintf(resp, sizeof(resp), "<p>Marks updated for ID %d. <a href='/'>Back</a></p>", sid);
                 send_text(client, "200 OK", "text/html; charset=utf-8", resp);
+                if (marks_txt) free(marks_txt);
                 close(client); return;
             }
 
-            /* legacy textarea */
-            if (id_s && marks) {
-                int sid = atoi(id_s);
-                free(id_s);
-                int idx = api_find_index_by_id(sid);
-                if (idx == -1) {
-                    send_text(client, "404 Not Found", "text/plain", "Student not found");
-                    free(marks); close(client); return;
-                }
-                char *line = strtok(marks, "\n");
-                int updated = 0;
-                while (line) {
-                    while (*line == ' ' || *line == '\r' || *line == '\t') line++;
-                    char *sep = strstr(line, "|");
-                    if (sep) {
-                        *sep = 0;
-                        char *subj = line;
-                        char *mstr = sep + 1;
-                        while (*mstr==' ') mstr++;
-                        int mk = atoi(mstr);
-                        if (mk < 0) mk = 0;
-                        /* find subject by exact name and set marks */
-                        for (int i=0;i<students[idx].num_subjects;++i) {
-                            if (strcmp(students[idx].subjects[i].name, subj)==0) {
-                                students[idx].subjects[i].marks = mk;
-                                updated++;
-                                break;
-                            }
-                        }
-                    }
-                    line = strtok(NULL, "\n");
-                }
-                free(marks);
-                api_calculate_update_cgpa(idx);
-                char resp[256];
-                snprintf(resp, sizeof(resp), "<p>Marks updated for ID %d (%d subjects updated). <a href='/'>Back</a></p>", sid, updated);
-                send_text(client, "200 OK", "text/html; charset=utf-8", resp);
+            /* If we reach here and only marks_txt exists (rare), process legacy textarea */
+            if (marks_txt) {
+                /* try to find an id inside marks_txt? The legacy branch earlier required id as separate field.
+                   Here we can't proceed without an id, so return error. */
+                send_text(client, "400 Bad Request", "text/plain", "Missing student id for legacy marks format");
+                free(marks_txt);
                 close(client); return;
             }
         }
 
-        /* Attendance POST (admin) - now honors 'semester' hidden field and updates only students in that semester */
+        /* Attendance POST (admin) - honors 'semester' hidden field and updates only students in that semester */
         if (strncmp(path, "/attendance", strlen("/attendance")) == 0) {
             char *subject = form_value(body, "subject");
             char *date = form_value(body, "date"); /* date string */
