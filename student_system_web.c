@@ -69,6 +69,9 @@ extern void api_generate_report(int idx, const char* college, const char* semest
 extern int api_calculate_update_cgpa(int idx);
 extern int api_admin_auth(const char *user, const char *pass);
 
+/* save_data is defined in student_system.c */
+extern void save_data(void);
+
 /* filesystem helper */
 static void ensure_reports_dir(void) {
     struct stat st;
@@ -158,6 +161,41 @@ static double compute_sgpa_local(const Student *s) {
     }
     if (total_credits == 0) return 0.0;
     return weighted / (double)total_credits;
+}
+
+/* helper to slugify subject for filename */
+static void slugify(const char *in, char *out, size_t outcap) {
+    size_t j=0;
+    for (size_t i=0; in[i] && j+1<outcap; ++i) {
+        char c = in[i];
+        if (isalnum((unsigned char)c)) out[j++]=tolower(c);
+        else if (c==' '||c=='_'||c=='-') {
+            if (j>0 && out[j-1]!='-') out[j++]='-';
+        }
+    }
+    if (j>0 && out[j-1]=='-') j--;
+    out[j]=0;
+}
+
+/* helper to add an array of subjects to a student (replaces the lambda used earlier) */
+static void add_subjects_to_student(Student *s, const char **list, const int *credits) {
+    if (!s || !list) return;
+    for (int i = 0; list[i] != NULL; ++i) {
+        /* skip duplicates */
+        int found = 0;
+        for (int k = 0; k < s->num_subjects; ++k) {
+            if (strcmp(s->subjects[k].name, list[i]) == 0) { found = 1; break; }
+        }
+        if (found) continue;
+        if (s->num_subjects >= MAX_SUBJECTS) break;
+        strncpy(s->subjects[s->num_subjects].name, list[i], sizeof(s->subjects[s->num_subjects].name)-1);
+        s->subjects[s->num_subjects].name[sizeof(s->subjects[s->num_subjects].name)-1] = '\0';
+        s->subjects[s->num_subjects].credits = credits ? credits[i] : 0;
+        s->subjects[s->num_subjects].marks = 0;
+        s->subjects[s->num_subjects].classes_held = 0;
+        s->subjects[s->num_subjects].classes_attended = 0;
+        s->num_subjects++;
+    }
 }
 
 /* Build landing page (signup includes extra fields) */
@@ -401,20 +439,6 @@ static char *build_student_dashboard(int idx) {
     return buf;
 }
 
-/* helper: slugify subject for filename */
-static void slugify(const char *in, char *out, size_t outcap) {
-    size_t j=0;
-    for (size_t i=0; in[i] && j+1<outcap; ++i) {
-        char c = in[i];
-        if (isalnum((unsigned char)c)) out[j++]=tolower(c);
-        else if (c==' '||c=='_'||c=='-') {
-            if (j>0 && out[j-1]!='-') out[j++]='-';
-        }
-    }
-    if (j>0 && out[j-1]=='-') j--;
-    out[j]=0;
-}
-
 /* handle a client connection */
 static void handle_client(int client) {
     char req[REQBUF];
@@ -505,7 +529,8 @@ static void handle_client(int client) {
             strcpy(buf, "<!doctype html><html><head><meta charset='utf-8'><title>Attendance</title></head><body><h2>Admin Attendance</h2>");
             strcat(buf, "<form method='get' action='/attendance'>Choose subject: <select name='subject'>");
             /* add options */
-            char *line = strtok(subjects, "\n");
+            char *subjects_copy = strdup(subjects);
+            char *line = strtok(subjects_copy, "\n");
             while (line) {
                 char esc[256]; html_escape_buf(line, esc, sizeof(esc));
                 char option[512];
@@ -514,6 +539,7 @@ static void handle_client(int client) {
                 strcat(buf, option);
                 line = strtok(NULL, "\n");
             }
+            free(subjects_copy);
             strcat(buf, "</select><button>Open</button></form>");
             if (subject_q[0]) {
                 /* show list of students with checkboxes for this subject */
@@ -616,10 +642,7 @@ static void handle_client(int client) {
             s.num_subjects = 0;
             strncpy(s.password, password, sizeof(s.password)-1); s.password[sizeof(s.password)-1]=0;
 
-            /* Build semester subjects by calling the same logic used in student_system.c:
-               We'll emulate "add_semesters_to_student" by adding subjects 1..sem.
-               For simplicity, list a default set for sem1..sem8 matching your student_system.c.
-               Note: If you later change semester lists in student_system.c you can also centralize this function there and expose an API. */
+            /* Default semester subjects arrays */
             const char *sem1[] = {
                 "Programming in C","Linux Lab","Problem Solving","Advanced Engineering Mathematics - I","Physics for Computer Engineers","Managing Self","Environmental Sustainability and Climate Change", NULL
             };
@@ -653,33 +676,15 @@ static void handle_client(int client) {
             };
             const int sem8_c[] = {3,5};
 
-            /* helper to add arrays */
-            auto add_list = [&](const char **list, const int *credits) {
-                for (int i=0; list[i]!=NULL; ++i) {
-                    /* check duplicates */
-                    int found=0;
-                    for (int k=0;k<s.num_subjects;++k) if (strcmp(s.subjects[k].name,list[i])==0) { found=1; break; }
-                    if (found) continue;
-                    if (s.num_subjects >= MAX_SUBJECTS) break;
-                    strncpy(s.subjects[s.num_subjects].name, list[i], sizeof(s.subjects[s.num_subjects].name)-1);
-                    s.subjects[s.num_subjects].name[sizeof(s.subjects[s.num_subjects].name)-1]=0;
-                    s.subjects[s.num_subjects].credits = credits ? credits[i] : 0;
-                    s.subjects[s.num_subjects].marks = 0;
-                    s.subjects[s.num_subjects].classes_held = 0;
-                    s.subjects[s.num_subjects].classes_attended = 0;
-                    s.num_subjects++;
-                }
-            };
-
             for (int cur=1; cur<=sem; ++cur) {
-                if (cur==1) add_list(sem1, sem1_c);
-                else if (cur==2) add_list(sem2, sem2_c);
-                else if (cur==3) add_list(sem3, sem3_c);
-                else if (cur==4) add_list(sem4, sem4_c);
-                else if (cur==5) add_list(sem5, sem5_c);
-                else if (cur==6) add_list(sem6, sem6_c);
-                else if (cur==7) add_list(sem7, sem7_c);
-                else if (cur==8) add_list(sem8, sem8_c);
+                if (cur==1) add_subjects_to_student(&s, sem1, sem1_c);
+                else if (cur==2) add_subjects_to_student(&s, sem2, sem2_c);
+                else if (cur==3) add_subjects_to_student(&s, sem3, sem3_c);
+                else if (cur==4) add_subjects_to_student(&s, sem4, sem4_c);
+                else if (cur==5) add_subjects_to_student(&s, sem5, sem5_c);
+                else if (cur==6) add_subjects_to_student(&s, sem6, sem6_c);
+                else if (cur==7) add_subjects_to_student(&s, sem7, sem7_c);
+                else if (cur==8) add_subjects_to_student(&s, sem8, sem8_c);
             }
 
             /* Save via API */
@@ -713,7 +718,7 @@ static void handle_client(int client) {
             close(client); return;
         }
 
-        /* Enter marks (admin) — format per-line: Subject Name|marks */
+        /* Enter marks (admin) */
         if (strncmp(path, "/enter-marks", 12) == 0) {
             char *id_s = form_value(body, "id");
             char *marks = form_value(body, "marks");
