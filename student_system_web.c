@@ -662,8 +662,7 @@ static void handle_client(int client) {
                 free(qs);
             }
             if (id <= 0 || pass[0]==0) {
-                send_text(client, "400 Bad Request", "text/plain", "Missing id or pass (use the sign-in form).",
-                          );
+                send_text(client, "400 Bad Request", "text/plain", "Missing id or pass (use the sign-in form).");
                 close(client); return;
             }
             int idx = api_find_index_by_id(id);
@@ -801,9 +800,7 @@ static void handle_client(int client) {
             int sem = atoi(semester);
             if (sapid <= 0 || sem < 1 || sem > 8) {
                 char resp[256];
-                snprintf(resp, sizeof(resp),
-                    "<!doctype html><html><body><p>Invalid SAP ID or semester provided.</p><p><a href='/'>Back</a></p></body></html>",
-                    s.id);
+                snprintf(resp, sizeof(resp), "<!doctype html><html><body><p>Invalid SAP ID or semester provided.</p><p><a href='/'>Back</a></p></body></html>");
                 send_text(client, "400 Bad Request", "text/html; charset=utf-8", resp);
                 goto signup_cleanup;
             }
