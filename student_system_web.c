@@ -1,8 +1,9 @@
 /* student_system_web.c
    Enhanced web wrapper for student_system.c
    - Landing page with Admin login / Student sign up / Student sign in
-   - Simple admin dashboard and student dashboard
-   - Inline SVG attendance chart for students
+   - Student signup asks email, phone, semester
+   - If signup semester = N, automatically adds subjects for sem 1..N (cumulative, deduped)
+   - Admin dashboard: enter marks, mark attendance (generate report removed)
    Compile together with student_system.c:
      gcc -DBUILD_WEB student_system.c student_system_web.c -o student_system_web
    Run:
@@ -32,8 +33,8 @@
 
 /* --- Ensure structs / constants match student_system.c exactly --- */
 #define MAX_NAME 100
-#define MAX_SUBJECTS 8
-#define MAX_SUB_NAME 50
+#define MAX_SUBJECTS 32
+#define MAX_SUB_NAME 100
 
 typedef struct {
     char name[MAX_SUB_NAME];
@@ -48,10 +49,12 @@ typedef struct {
     char name[MAX_NAME];
     int age;
     char dept[MAX_NAME];
-    int year;
+    int year;              // used as semester number for mapping
     int num_subjects;
     Subject subjects[MAX_SUBJECTS];
     char password[50];
+    char email[100];
+    char phone[32];
     int exists;
     double cgpa;
     int total_credits_completed;
@@ -65,9 +68,8 @@ extern int student_count;
 /* API wrappers (must be defined in student_system.c) */
 extern int api_find_index_by_id(int id);
 extern int api_add_student(Student *s);
-extern void api_generate_report(int idx, const char* college, const char* semester, const char* exam);
 extern int api_calculate_update_cgpa(int idx);
-/* persist helper from main C file */
+/* optional persistence helper in student_system.c (implement if you want persistent storage) */
 extern void save_data(void);
 
 /* filesystem helper */
@@ -161,7 +163,272 @@ static double compute_sgpa_local(const Student *s) {
     return weighted / (double)total_credits;
 }
 
-/* Build landing page with three cards */
+/* ---- Helpers to add subjects and to set cumulative semester subjects ---- */
+
+/* add provided subject list to student if not already present (dedupe by name) */
+static void add_subject_list_to_student(Student *s, const char *names[], const int credits[], int n) {
+    for (int i = 0; i < n; ++i) {
+        const char *nm = names[i];
+        if (!nm || !nm[0]) continue;
+        /* check existing */
+        int found = 0;
+        for (int j = 0; j < s->num_subjects; ++j) {
+            if (strcasecmp(s->subjects[j].name, nm) == 0) { found = 1; break; }
+        }
+        if (found) continue;
+        if (s->num_subjects >= MAX_SUBJECTS) break;
+        int idx = s->num_subjects++;
+        strncpy(s->subjects[idx].name, nm, sizeof(s->subjects[idx].name)-1);
+        s->subjects[idx].name[sizeof(s->subjects[idx].name)-1] = '\0';
+        s->subjects[idx].credits = credits[i];
+        s->subjects[idx].marks = 0;
+        s->subjects[idx].classes_held = 0;
+        s->subjects[idx].classes_attended = 0;
+    }
+}
+
+/* set (replace) subjects for a single semester (keeps only that semester) */
+static void set_subjects_for_single_semester(Student *s, int sem) {
+    /* clear previous */
+    for (int i = 0; i < MAX_SUBJECTS; ++i) {
+        s->subjects[i].name[0] = '\0';
+        s->subjects[i].credits = 0;
+        s->subjects[i].marks = 0;
+        s->subjects[i].classes_held = 0;
+        s->subjects[i].classes_attended = 0;
+    }
+    s->num_subjects = 0;
+
+    if (sem <= 0) sem = 1;
+
+    if (sem == 1) {
+        const char *names[] = {
+            "Programming in C",
+            "Linux Lab",
+            "Problem Solving",
+            "Advanced Engineering Mathematics - I",
+            "Physics for Computer Engineers",
+            "Managing Self",
+            "Environmental Sustainability and Climate Change"
+        };
+        const int credits[] = {5,2,2,4,5,2,2};
+        add_subject_list_to_student(s, names, credits, 7);
+    } else if (sem == 2) {
+        const char *names[] = {
+            "Data Structures and Algorithms",
+            "Digital Electronics",
+            "Python Programming",
+            "Advanced Engineering Mathematics - II",
+            "Environmental Sustainability and Climate Change",
+            "Time and Priority Management",
+            "Elements of AI/ML"
+        };
+        const int credits[] = {5,3,5,4,2,2,3};
+        add_subject_list_to_student(s, names, credits, 7);
+    } else if (sem == 3) {
+        const char *names[] = {
+            "Leading Conversations",
+            "Discrete Mathematical Structures",
+            "Operating Systems",
+            "Elements of AIML",
+            "Database Management Systems",
+            "Design and Analysis of Algorithms"
+        };
+        const int credits[] = {2,3,3,3,5,4};
+        add_subject_list_to_student(s, names, credits, 6);
+    } else if (sem == 4) {
+        const char *names[] = {
+            "Software Engineering",
+            "EDGE - SoftSkills",
+            "Linear Algebra",
+            "Indian Constitution",
+            "Writing with Impact",
+            "Object Oriented Programming",
+            "Data Communication and Networks",
+            "Applied Machine Learning"
+        };
+        const int credits[] = {3,0,3,0,2,4,4,5};
+        add_subject_list_to_student(s, names, credits, 8);
+    } else if (sem == 5) {
+        const char *names[] = {
+            "Cryptography and Network Security",
+            "Formal Languages and Automata Theory",
+            "Object Oriented Analysis and Design",
+            "Exploratory-3",
+            "Start Your Startup",
+            "Research Methodology in CS",
+            "Probability, Entropy, and MC Simulation",
+            "PE-2",
+            "PE-2 Lab"
+        };
+        const int credits[] = {3,3,3,3,2,3,3,4,1};
+        add_subject_list_to_student(s, names, credits, 9);
+    } else if (sem == 6) {
+        const char *names[] = {
+            "Exploratory-4",
+            "Leadership and Teamwork",
+            "Compiler Design",
+            "Statistics and Data Analysis",
+            "PE-3",
+            "PE-3 Lab",
+            "Minor Project"
+        };
+        const int credits[] = {3,2,3,3,4,1,5};
+        add_subject_list_to_student(s, names, credits, 7);
+    } else if (sem == 7) {
+        const char *names[] = {
+            "Exploratory-5",
+            "PE-4",
+            "PE-4 Lab",
+            "PE-5",
+            "PE-5 Lab",
+            "Capstone Project - Phase-1",
+            "Summer Internship"
+        };
+        const int credits[] = {3,4,1,3,1,5,1};
+        add_subject_list_to_student(s, names, credits, 7);
+    } else { /* sem == 8 */
+        const char *names[] = {
+            "IT Ethical Practices",
+            "Capstone Project - Phase-2"
+        };
+        const int credits[] = {3,5};
+        add_subject_list_to_student(s, names, credits, 2);
+    }
+}
+
+/* set subjects cumulatively from sem 1 .. sem N (deduped) */
+static void set_subjects_up_to_semester(Student *s, int sem) {
+    if (sem < 1) sem = 1;
+    /* start empty */
+    for (int i = 0; i < MAX_SUBJECTS; ++i) {
+        s->subjects[i].name[0] = '\0';
+        s->subjects[i].credits = 0;
+        s->subjects[i].marks = 0;
+        s->subjects[i].classes_held = 0;
+        s->subjects[i].classes_attended = 0;
+    }
+    s->num_subjects = 0;
+    for (int k = 1; k <= sem; ++k) {
+        /* reuse single-semester helper: it will call add_subject_list_to_student which dedupes */
+        set_subjects_for_single_semester(s, k);
+        /* Note: set_subjects_for_single_semester currently clears then adds — to use add_subject_list we must
+           instead copy semester arrays here. To avoid duplication of semester arrays we create a temporary Student t
+           and then add its subjects via add_subject_list_to_student. */
+        /* But simpler: call small per-sem arrays by duplicating logic here instead. For clarity we call set_subjects_for_single_semester on a temp */
+    }
+    /* The above approach cleared subjects each iteration; to implement cumulative properly, we'll instead
+       manually add subjects per semester by calling add_subject_list_to_student with the same arrays used above. */
+    /* Re-implement properly below as explicit loop to avoid confusion. */
+    /* Clear again and add cumulatively: */
+    for (int i = 0; i < MAX_SUBJECTS; ++i) {
+        s->subjects[i].name[0] = '\0';
+        s->subjects[i].credits = 0;
+        s->subjects[i].marks = 0;
+        s->subjects[i].classes_held = 0;
+        s->subjects[i].classes_attended = 0;
+    }
+    s->num_subjects = 0;
+
+    for (int semidx = 1; semidx <= sem; ++semidx) {
+        if (semidx == 1) {
+            const char *names[] = {
+                "Programming in C",
+                "Linux Lab",
+                "Problem Solving",
+                "Advanced Engineering Mathematics - I",
+                "Physics for Computer Engineers",
+                "Managing Self",
+                "Environmental Sustainability and Climate Change"
+            };
+            const int credits[] = {5,2,2,4,5,2,2};
+            add_subject_list_to_student(s, names, credits, 7);
+        } else if (semidx == 2) {
+            const char *names[] = {
+                "Data Structures and Algorithms",
+                "Digital Electronics",
+                "Python Programming",
+                "Advanced Engineering Mathematics - II",
+                "Environmental Sustainability and Climate Change",
+                "Time and Priority Management",
+                "Elements of AI/ML"
+            };
+            const int credits[] = {5,3,5,4,2,2,3};
+            add_subject_list_to_student(s, names, credits, 7);
+        } else if (semidx == 3) {
+            const char *names[] = {
+                "Leading Conversations",
+                "Discrete Mathematical Structures",
+                "Operating Systems",
+                "Elements of AIML",
+                "Database Management Systems",
+                "Design and Analysis of Algorithms"
+            };
+            const int credits[] = {2,3,3,3,5,4};
+            add_subject_list_to_student(s, names, credits, 6);
+        } else if (semidx == 4) {
+            const char *names[] = {
+                "Software Engineering",
+                "EDGE - SoftSkills",
+                "Linear Algebra",
+                "Indian Constitution",
+                "Writing with Impact",
+                "Object Oriented Programming",
+                "Data Communication and Networks",
+                "Applied Machine Learning"
+            };
+            const int credits[] = {3,0,3,0,2,4,4,5};
+            add_subject_list_to_student(s, names, credits, 8);
+        } else if (semidx == 5) {
+            const char *names[] = {
+                "Cryptography and Network Security",
+                "Formal Languages and Automata Theory",
+                "Object Oriented Analysis and Design",
+                "Exploratory-3",
+                "Start Your Startup",
+                "Research Methodology in CS",
+                "Probability, Entropy, and MC Simulation",
+                "PE-2",
+                "PE-2 Lab"
+            };
+            const int credits[] = {3,3,3,3,2,3,3,4,1};
+            add_subject_list_to_student(s, names, credits, 9);
+        } else if (semidx == 6) {
+            const char *names[] = {
+                "Exploratory-4",
+                "Leadership and Teamwork",
+                "Compiler Design",
+                "Statistics and Data Analysis",
+                "PE-3",
+                "PE-3 Lab",
+                "Minor Project"
+            };
+            const int credits[] = {3,2,3,3,4,1,5};
+            add_subject_list_to_student(s, names, credits, 7);
+        } else if (semidx == 7) {
+            const char *names[] = {
+                "Exploratory-5",
+                "PE-4",
+                "PE-4 Lab",
+                "PE-5",
+                "PE-5 Lab",
+                "Capstone Project - Phase-1",
+                "Summer Internship"
+            };
+            const int credits[] = {3,4,1,3,1,5,1};
+            add_subject_list_to_student(s, names, credits, 7);
+        } else { /* 8 */
+            const char *names[] = {
+                "IT Ethical Practices",
+                "Capstone Project - Phase-2"
+            };
+            const int credits[] = {3,5};
+            add_subject_list_to_student(s, names, credits, 2);
+        }
+    }
+}
+
+/* Build landing page with three cards (includes email/phone/semester signup) */
 static char *build_landing_page(void) {
     ensure_reports_dir();
     const char *html_start =
@@ -187,7 +454,7 @@ static char *build_landing_page(void) {
     const char *admin_card =
         "<div class='card'>"
         "<h3>Admin Login</h3>"
-        "<p>Full admin control: manage students, marks, attendance, generate reports.</p>"
+        "<p>Full admin control: manage students, marks, attendance.</p>"
         "<form method='post' action='/admin-login'>"
         "<input name='username' placeholder='Admin username' required />"
         "<input name='password' placeholder='Admin password' type='password' required />"
@@ -198,11 +465,23 @@ static char *build_landing_page(void) {
     const char *signup_card =
         "<div class='card'>"
         "<h3>Student Sign Up</h3>"
-        "<p>Register for Semester 1 (default subjects added automatically).</p>"
+        "<p>Register — select your current semester. Subjects for all previous semesters will be added automatically.</p>"
         "<form method='post' action='/student-signup'>"
         "<input name='name' placeholder='Full Name' required />"
         "<input name='age' placeholder='Age' required />"
         "<input name='sap_id' placeholder='SAP ID' required />"
+        "<input name='email' placeholder='Email' required />"
+        "<input name='phone' placeholder='Phone' required />"
+        "<select name='semester' required>"
+        "<option value='1'>Semester 1</option>"
+        "<option value='2'>Semester 2</option>"
+        "<option value='3'>Semester 3</option>"
+        "<option value='4'>Semester 4</option>"
+        "<option value='5'>Semester 5</option>"
+        "<option value='6'>Semester 6</option>"
+        "<option value='7'>Semester 7</option>"
+        "<option value='8'>Semester 8</option>"
+        "</select>"
         "<input name='password' placeholder='Password' type='password' required />"
         "<div style='margin-top:8px'><button>Sign Up</button></div>"
         "</form>"
@@ -222,7 +501,7 @@ static char *build_landing_page(void) {
 
     const char *footer = "</div><p class='small'>Demo by Tanay Sah & Mahika Jaglan — for demonstration only.</p></div></body></html>";
 
-    size_t cap = strlen(html_start) + strlen(admin_card) + strlen(signup_card) + strlen(signin_card) + strlen(footer) + 256;
+    size_t cap = strlen(html_start) + strlen(admin_card) + strlen(signup_card) + strlen(signin_card) + strlen(footer) + 512;
     char *buf = malloc(cap);
     if (!buf) return NULL;
     strcpy(buf, html_start);
@@ -305,11 +584,12 @@ static char *build_list_html(void) {
     size_t cap = 8192;
     char *buf = malloc(cap);
     if (!buf) return NULL;
-    strcpy(buf, "<!doctype html><html><head><meta charset='utf-8'><title>Students</title></head><body><h2>Students</h2><table border='1' cellpadding='6'><tr><th>ID</th><th>Name</th><th>Year</th><th>Dept</th></tr>");
+    strcpy(buf, "<!doctype html><html><head><meta charset='utf-8'><title>Students</title></head><body><h2>Students</h2><table border='1' cellpadding='6'><tr><th>ID</th><th>Name</th><th>Sem</th><th>Dept</th><th>Email</th><th>Phone</th></tr>");
     for (int i = 0; i < student_count; ++i) {
         if (!students[i].exists) continue;
-        char row[1024];
-        snprintf(row, sizeof(row), "<tr><td>%d</td><td>%s</td><td>%d</td><td>%s</td></tr>", students[i].id, students[i].name, students[i].year, students[i].dept);
+        char row[2048];
+        snprintf(row, sizeof(row), "<tr><td>%d</td><td>%s</td><td>%d</td><td>%s</td><td>%s</td><td>%s</td></tr>",
+                 students[i].id, students[i].name, students[i].year, students[i].dept, students[i].email, students[i].phone);
         if (strlen(buf) + strlen(row) + 256 > cap) { cap *= 2; buf = realloc(buf, cap); }
         strcat(buf, row);
     }
@@ -317,13 +597,16 @@ static char *build_list_html(void) {
     return buf;
 }
 
-/* build student dashboard as HTML with an inline SVG attendance graph */
+/* build student dashboard as HTML with an inline SVG attendance graph (shows email & phone & semester) */
 static char *build_student_dashboard(int idx) {
     if (idx < 0 || idx >= student_count) return NULL;
     Student *s = &students[idx];
     char escaped_name[256]; html_escape_buf(s->name, escaped_name, sizeof(escaped_name));
+    char escaped_email[256]; html_escape_buf(s->email, escaped_email, sizeof(escaped_email));
+    char escaped_phone[64]; html_escape_buf(s->phone, escaped_phone, sizeof(escaped_phone));
+
     /* build subject table & gather attendance percentages for chart */
-    char subject_rows[8192];
+    char subject_rows[16384];
     subject_rows[0] = 0;
     int maxbars = s->num_subjects;
     int percentages[MAX_SUBJECTS];
@@ -332,7 +615,7 @@ static char *build_student_dashboard(int idx) {
         int att = s->subjects[i].classes_attended;
         int pct = (held == 0) ? 0 : (int)(((double)att / held) * 100.0 + 0.5);
         percentages[i] = pct;
-        char row[512];
+        char row[1024];
         char sname_esc[256]; html_escape_buf(s->subjects[i].name, sname_esc, sizeof(sname_esc));
         double gp = (s->subjects[i].credits>0)? marks_to_grade_point_local(s->subjects[i].marks) : 0;
         snprintf(row, sizeof(row),
@@ -342,10 +625,10 @@ static char *build_student_dashboard(int idx) {
     }
     double sgpa = compute_sgpa_local(s);
     /* Build small inline SVG bar chart */
-    char svg[4096];
-    int w = 480, h = 160, pad = 30;
+    char svg[8192];
+    int w = 640, h = 220, pad = 36;
     int barw = (maxbars>0) ? ( (w - pad*2) / maxbars - 8 ) : 20;
-    if (barw < 8) barw = 8;
+    if (barw < 6) barw = 6;
     char svg_start[256];
     snprintf(svg_start, sizeof(svg_start), "<svg viewBox='0 0 %d %d' width='%d' height='%d' xmlns='http://www.w3.org/2000/svg'><rect width='100%%' height='100%%' fill='transparent'/>", w, h, w, h);
     strcpy(svg, svg_start);
@@ -359,33 +642,34 @@ static char *build_student_dashboard(int idx) {
                  "<rect x='%d' y='%d' width='%d' height='%d' rx='4' ry='4' fill='#3b82f6' opacity='0.85'/>",
                  x, y, barw, barh);
         /* label (short) */
-        char lbl[64]; html_escape_buf(s->subjects[i].name, lbl, sizeof(lbl));
-        if (strlen(lbl) > 18) lbl[18] = '\0';
+        char lbl[96]; html_escape_buf(s->subjects[i].name, lbl, sizeof(lbl));
+        if (strlen(lbl) > 20) lbl[20] = '\0';
         snprintf(svg + strlen(svg), sizeof(svg)-strlen(svg),
-                 "<text x='%d' y='%d' font-size='10' fill='#111'>%s</text>",
-                 x, h-pad+12, lbl);
+                 "<text x='%d' y='%d' font-size='11' fill='#111'>%s</text>",
+                 x, h-pad+14, lbl);
     }
     strcat(svg, "</svg>");
 
     const char *tpl_start =
         "<!doctype html><html><head><meta charset='utf-8'><title>Dashboard</title>"
         "<meta name='viewport' content='width=device-width,initial-scale=1'/>"
-        "<style>body{font-family:Inter,Arial;margin:18px} .card{background:#fff;padding:18px;border-radius:10px;box-shadow:0 6px 18px rgba(0,0,0,0.06);max-width:1000px;margin:auto} table{width:100%;border-collapse:collapse} table th,table td{padding:8px;border:1px solid #eee;text-align:left;font-size:14px}</style>"
+        "<style>body{font-family:Inter,Arial;margin:18px} .card{background:#fff;padding:18px;border-radius:10px;box-shadow:0 6px 18px rgba(0,0,0,0.06);max-width:1100px;margin:auto} table{width:100%;border-collapse:collapse} table th,table td{padding:8px;border:1px solid #eee;text-align:left;font-size:14px}</style>"
         "</head><body><div class='card'>";
 
     const char *tpl_end = "<p><a href='/'>← Back to Home</a></p></div></body></html>";
 
     /* estimate size */
-    size_t cap = strlen(tpl_start) + 4096 + strlen(subject_rows) + strlen(svg) + 1024;
+    size_t cap = strlen(tpl_start) + 8192 + strlen(subject_rows) + strlen(svg) + 2048;
     char *buf = malloc(cap);
     if (!buf) return NULL;
     strcpy(buf, tpl_start);
-    char header[512];
+    char header[1024];
     char dept_esc[256]; html_escape_buf(s->dept, dept_esc, sizeof(dept_esc));
     snprintf(header, sizeof(header),
-             "<h2>Welcome, %s</h2><p>ID: %d | Dept: %s | Year: %d | Age: %d</p>"
+             "<h2>Welcome, %s</h2><p>ID: %d | Dept: %s | Semester: %d | Age: %d</p>"
+             "<p>Email: %s | Phone: %s</p>"
              "<p><strong>SGPA (current):</strong> %.3f  &nbsp;&nbsp; <strong>Stored CGPA:</strong> %.3f (Credits: %d)</p>",
-             escaped_name, s->id, dept_esc, s->year, s->age, sgpa, s->cgpa, s->total_credits_completed);
+             escaped_name, s->id, dept_esc, s->year, s->age, escaped_email, escaped_phone, sgpa, s->cgpa, s->total_credits_completed);
     strcat(buf, header);
     strcat(buf, "<h3>Attendance (per subject)</h3>");
     strcat(buf, svg);
@@ -490,40 +774,36 @@ static void handle_client(int client) {
               "<input name='date' placeholder='Date (YYYY-MM-DD) - optional (default today)' />"
               "<div style='margin-top:8px'><button>Load Student List</button></div>"
               "</form>"
-              "<h3>Generate report</h3>"
-              "<form method='post' action='/generate'>"
-              "<input name='id' placeholder='Student ID' required />"
-              "<input name='college' placeholder='College' />"
-              "<input name='semester' placeholder='Semester' />"
-              "<input name='exam' placeholder='Exam' />"
-              "<button>Generate</button></form>"
               "<p><a href='/'>Back</a></p></div></body></html>";
             send_text(client, "200 OK", "text/html; charset=utf-8", adm);
             close(client); return;
         }
 
-        /* --- Student sign-up (auto-add semester 1 subjects) --- */
+        /* --- Student sign-up (auto-add semester 1..N subjects) --- */
         if (strncmp(path, "/student-signup", 16) == 0) {
             char *name = form_value(body, "name");
             char *age = form_value(body, "age");
             char *sap = form_value(body, "sap_id");
+            char *email = form_value(body, "email");
+            char *phone = form_value(body, "phone");
+            char *semester = form_value(body, "semester");
             char *password = form_value(body, "password");
-            if (!name || !age || !sap || !password) {
+            if (!name || !age || !sap || !password || !email || !phone || !semester) {
                 send_text(client, "400 Bad Request", "text/plain", "Missing fields");
-                if (name) free(name);
-                if (age) free(age);
-                if (sap) free(sap);
+                if (name) free(name); if (age) free(age); if (sap) free(sap);
+                if (email) free(email); if (phone) free(phone); if (semester) free(semester);
                 if (password) free(password);
                 close(client); return;
             }
 
             int sapid = atoi(sap);
-            if (sapid <= 0) {
+            int semnum = atoi(semester);
+            if (sapid <= 0 || semnum < 1 || semnum > 8) {
                 char resp[256];
                 snprintf(resp, sizeof(resp),
-                    "<!doctype html><html><body><p>Invalid SAP ID provided. Use numeric SAP ID (e.g. 590012345).</p><p><a href='/'>Back</a></p></body></html>");
+                    "<!doctype html><html><body><p>Invalid SAP ID or semester. Use numeric SAP ID and semester 1-8.</p><p><a href='/'>Back</a></p></body></html>");
                 send_text(client, "400 Bad Request", "text/html; charset=utf-8", resp);
-                free(name); free(age); free(sap); free(password);
+                free(name); free(age); free(sap); free(email); free(phone); free(semester); free(password);
                 close(client); return;
             }
 
@@ -536,33 +816,16 @@ static void handle_client(int client) {
             strncpy(s.name, name, sizeof(s.name) - 1); s.name[sizeof(s.name)-1] = '\0';
             s.age = atoi(age);
             strncpy(s.dept, "B.Tech CSE", sizeof(s.dept) - 1); s.dept[sizeof(s.dept)-1] = '\0';
-            s.year = 1; /* Default to year 1 / semester 1 */
-            s.num_subjects = 7;
+            s.year = semnum; /* sem selected by user */
             s.id = sapid;
             strncpy(s.password, password, sizeof(s.password) - 1); s.password[sizeof(s.password)-1] = '\0';
+            strncpy(s.email, email, sizeof(s.email)-1); s.email[sizeof(s.email)-1] = '\0';
+            strncpy(s.phone, phone, sizeof(s.phone)-1); s.phone[sizeof(s.phone)-1] = '\0';
 
-            /* Default semester 1 subjects & credits */
-            const char *default_subjects[7] = {
-                "Programming in C",
-                "Linux Lab",
-                "Problem Solving",
-                "Advanced Engineering Mathematics - I",
-                "Physics for Computer Engineers",
-                "Managing Self",
-                "Environmental Sustainability and Climate Change"
-            };
-            const int credits[7] = {5, 2, 2, 4, 5, 2, 2};
+            /* Set subjects cumulatively up to s.year */
+            set_subjects_up_to_semester(&s, s.year);
 
-            for (int j = 0; j < 7; ++j) {
-                strncpy(s.subjects[j].name, default_subjects[j], sizeof(s.subjects[j].name) - 1);
-                s.subjects[j].name[sizeof(s.subjects[j].name) - 1] = '\0';
-                s.subjects[j].credits = credits[j];
-                s.subjects[j].marks = 0;
-                s.subjects[j].classes_held = 0;
-                s.subjects[j].classes_attended = 0;
-            }
-
-            /* Save student (api_add_student returns -2 on duplicate id - implement that behavior in student_system.c if desired) */
+            /* Save student (api_add_student returns -2 on duplicate id) */
             int addres = api_add_student(&s);
             if (addres == -2) {
                 char resp[256];
@@ -573,16 +836,74 @@ static void handle_client(int client) {
             } else if (addres <= 0) {
                 send_text(client, "500 Internal Server Error", "text/plain", "Unable to register");
             } else {
+                save_data();
                 char resp[512];
                 snprintf(resp, sizeof(resp),
                     "<!doctype html><html><body><p>Registration successful!</p>"
                     "<p>Your Student ID (SAP ID): <strong>%d</strong></p>"
-                    "<p>Default Semester 1 subjects have been added automatically.</p>"
-                    "<p><a href='/'>Back to Home</a></p></body></html>", addres);
+                    "<p>Subjects for semesters 1..%d have been added automatically.</p>"
+                    "<p><a href='/'>Back to Home</a></p></body></html>", addres, s.year);
                 send_text(client, "200 OK", "text/html; charset=utf-8", resp);
             }
 
-            free(name); free(age); free(sap); free(password);
+            free(name); free(age); free(sap); free(email); free(phone); free(semester); free(password);
+            close(client); return;
+        }
+
+        /* --- Admin: add student (form) --- */
+        if (strncmp(path, "/add", 4) == 0) {
+            char *name = form_value(body, "name");
+            char *age = form_value(body, "age");
+            char *dept = form_value(body, "dept");
+            char *year = form_value(body, "year");
+            char *num_sub = form_value(body, "num_subjects");
+            char *subjects = form_value(body, "subjects");
+            char *password = form_value(body, "password");
+            if (!name || !age || !dept || !year || !password) {
+                send_text(client, "400 Bad Request", "text/plain", "Missing fields (name/age/dept/year/password required)");
+                goto add_cleanup;
+            }
+            Student s; memset(&s, 0, sizeof(s));
+            s.exists = 1; s.cgpa = 0.0; s.total_credits_completed = 0;
+            strncpy(s.name, name, sizeof(s.name)-1); s.name[sizeof(s.name)-1] = '\0';
+            s.age = atoi(age);
+            strncpy(s.dept, dept, sizeof(s.dept)-1); s.dept[sizeof(s.dept)-1] = '\0';
+            s.year = atoi(year); if (s.year < 1) s.year = 1;
+            s.id = 0; /* admin can set explicit id if you extend form */
+            strncpy(s.password, password, sizeof(s.password)-1); s.password[sizeof(s.password)-1] = '\0';
+
+            /* If admin provided explicit subject list, use it; otherwise use cumulative semester mapping */
+            if (subjects && strlen(subjects) > 1) {
+                int ns = atoi(num_sub ? num_sub : "0");
+                if (ns <= 0 || ns > MAX_SUBJECTS) ns = MAX_SUBJECTS;
+                char *tmp = strdup(subjects);
+                char *tok = strtok(tmp, ",");
+                int si = 0;
+                while (tok && si < ns) {
+                    while (*tok == ' ') tok++;
+                    strncpy(s.subjects[si].name, tok, sizeof(s.subjects[si].name)-1);
+                    s.subjects[si].name[sizeof(s.subjects[si].name)-1] = '\0';
+                    s.subjects[si].classes_held = s.subjects[si].classes_attended = s.subjects[si].marks = s.subjects[si].credits = 0;
+                    si++; tok = strtok(NULL, ",");
+                }
+                free(tmp);
+                s.num_subjects = ns;
+            } else {
+                /* apply cumulative semester mapping */
+                set_subjects_up_to_semester(&s, s.year);
+            }
+
+            api_add_student(&s);
+            save_data();
+            send_text(client, "200 OK", "text/html; charset=utf-8", "<p>Student added. <a href='/'>Back</a></p>");
+        add_cleanup:
+            if (name) free(name);
+            if (age) free(age);
+            if (dept) free(dept);
+            if (year) free(year);
+            if (num_sub) free(num_sub);
+            if (subjects) free(subjects);
+            if (password) free(password);
             close(client); return;
         }
 
@@ -602,7 +923,6 @@ static void handle_client(int client) {
             snprintf(page, cap, "<!doctype html><html><head><meta charset='utf-8'><title>Enter Marks</title></head><body><h2>Enter marks for %s (ID %d)</h2><form method='post' action='/enter-marks-submit'>", s->name, s->id);
             for (int i = 0; i < s->num_subjects; ++i) {
                 char tmp[512];
-                /* show subject name and an input; include hidden subidx field so server knows mapping */
                 snprintf(tmp, sizeof(tmp),
                          "<label>%s (Credits: %d):<br><input name='mark_%d' placeholder='Marks (0-100)' required /></label>"
                          "<input type='hidden' name='subidx_%d' value='%d' />",
@@ -670,10 +990,11 @@ static void handle_client(int client) {
             for (int i = 0; i < student_count; ++i) {
                 if (!students[i].exists) continue;
                 for (int j = 0; j < students[i].num_subjects; ++j) {
-                    if (strcmp(students[i].subjects[j].name, subject) == 0) {
-                        char row[600];
-                        /* checkbox present_<id>, hidden studentid_<id> = "sid|subidx" */
-                        snprintf(row, sizeof(row), "<div style='margin:8px 0'><label><input type='checkbox' name='present_%d' /> Present</label> - ID: %d | %s</div><input type='hidden' name='studentid_%d' value='%d|%d' />", students[i].id, students[i].id, students[i].name, students[i].id, students[i].id, j);
+                    if (strcasecmp(students[i].subjects[j].name, subject) == 0) {
+                        char row[800];
+                        snprintf(row, sizeof(row),
+                                 "<div style='margin:8px 0'><label><input type='checkbox' name='present_%d' /> Present</label> - ID: %d | %s</div><input type='hidden' name='studentid_%d' value='%d|%d' />",
+                                 students[i].id, students[i].id, students[i].name, students[i].id, students[i].id, j);
                         strncat(page, row, cap - strlen(page) - 1);
                         found = 1;
                         break;
@@ -727,34 +1048,6 @@ static void handle_client(int client) {
             snprintf(resp, sizeof(resp), "<!doctype html><html><body><p>Attendance recorded for subject '%s' on %s.</p><p><a href='/'>Back</a></p></body></html>", subject, date);
             send_text(client, "200 OK", "text/html; charset=utf-8", resp);
             free(subject); free(date);
-            close(client); return;
-        }
-
-        /* --- Generate report --- */
-        if (strncmp(path, "/generate", 9) == 0) {
-            char *id_s = form_value(body, "id");
-            char *college = form_value(body, "college");
-            char *semester = form_value(body, "semester");
-            char *exam = form_value(body, "exam");
-            if (!id_s) {
-                send_text(client, "400 Bad Request", "text/plain", "Missing id");
-                if (college) free(college);
-                if (semester) free(semester);
-                if (exam) free(exam);
-                close(client); return;
-            }
-            int sid = atoi(id_s);
-            free(id_s);
-            int idx = api_find_index_by_id(sid);
-            if (idx == -1) { send_text(client, "404 Not Found", "text/plain", "Student not found"); if (college) free(college); if (semester) free(semester); if (exam) free(exam); close(client); return; }
-            char cbuf[256] = "Your College", sbuf[128] = "Semester -", ebuf[128] = "Exam -";
-            if (college) { strncpy(cbuf, college, sizeof(cbuf)-1); cbuf[sizeof(cbuf)-1] = '\0'; free(college); }
-            if (semester) { strncpy(sbuf, semester, sizeof(sbuf)-1); sbuf[sizeof(sbuf)-1] = '\0'; free(semester); }
-            if (exam) { strncpy(ebuf, exam, sizeof(ebuf)-1); ebuf[sizeof(ebuf)-1] = '\0'; free(exam); }
-            api_generate_report(idx, cbuf, sbuf, ebuf);
-            char resp[256];
-            snprintf(resp, sizeof(resp), "<p>Report generated: reports/%d_result.html <a href='/'>Back</a></p>", sid);
-            send_text(client, "200 OK", "text/html; charset=utf-8", resp);
             close(client); return;
         }
 
