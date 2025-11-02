@@ -1,38 +1,44 @@
-/* student_system_web.c
-   Web wrapper for student_system.c
-   - Updated: fix enter-marks POST handling (table-based), improved student dashboard:
-     groups by semester with latest semester on top, shows current-semester SGPA and marks,
-     and shows stored CGPA.
-   Compile:
-     gcc -DBUILD_WEB student_system.c student_system_web.c -o student_system_web
+/* student_system.c
+   Student Record, Attendance, Grades & Printable Result Report
+   - Interactive console program (admin + student)
+   - Non-interactive CLI modes for web hosting / automated use
+   - API wrappers for linking with a separate web-server binary
+
+   Edits:
+    - semester mapping helper `subject_semester`
+    - deterministic random defaults for marks & attendance via populate_random_results()
+    - calculate_and_update_cgpa_for_student now recomputes CGPA over all subjects (correct and idempotent)
 */
 
 #define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <strings.h>   // strcasestr
 #include <ctype.h>
-#include <unistd.h>
-#include <errno.h>
 #include <time.h>
-#include <limits.h>
-#include <arpa/inet.h>
-#include <netinet/in.h>
-#include <sys/socket.h>
-#include <sys/types.h>
-#include <sys/stat.h>
-#include <dirent.h>
 
-#ifndef PATH_MAX
-#define PATH_MAX 4096
+#ifdef _WIN32
+  #include <direct.h>
+  #include <io.h>
+  #define MKDIR(d) _mkdir(d)
+  #define isatty _isatty
+#else
+  #include <sys/stat.h>
+  #include <sys/types.h>
+  #include <unistd.h>
+  #define MKDIR(d) mkdir(d, 0755)
 #endif
 
-/* --- Keep structs consistent with student_system.c --- */
+#define DATA_FILE "students.dat"
+#define REPORTS_DIR "reports"
+#define MAX_STUDENTS 2000
 #define MAX_NAME 100
-#define MAX_SUBJECTS 64
+#define MAX_SUBJECTS 64   /* increased to store many semesters worth of subjects */
 #define MAX_SUB_NAME 100
+#define ADMIN_USER "admin"
+#define ADMIN_PASS "admin"
 
+/* ---------- types ---------- */
 typedef struct {
     char name[MAX_SUB_NAME];
     int classes_held;
@@ -49,7 +55,7 @@ typedef struct {
     char phone[32];
     char dept[MAX_NAME];
     int year;
-    int current_semester;
+    int current_semester;        /* new: current semester (1..8) */
     int num_subjects;
     Subject subjects[MAX_SUBJECTS];
     char password[50];
@@ -58,85 +64,260 @@ typedef struct {
     int total_credits_completed;
 } Student;
 
-/* --- externs from student_system.c --- */
-extern Student students[];
-extern int student_count;
+/* Global in-memory storage (non-static so web wrapper can link) */
+Student students[MAX_STUDENTS];
+int student_count = 0;
 
-extern int api_find_index_by_id(int id);
-extern int api_add_student(Student *s);
-extern void api_generate_report(int idx, const char* college, const char* semester, const char* exam);
-extern int api_calculate_update_cgpa(int idx);
-extern int api_admin_auth(const char *user, const char *pass);
+/* forward declarations to avoid implicit warnings */
+void save_data(void);
+void load_data(void);
+int find_index_by_id(int id);
+int api_find_index_by_id(int id);
+int api_add_student(Student *s);
+void api_generate_report(int idx, const char* college, const char* semester, const char* exam);
+int api_calculate_update_cgpa(int idx);
+int api_admin_auth(const char *user, const char *pass);
+void generate_html_report(int idx, const char* college, const char* semester, const char* exam);
+double calculate_sgpa_for_student(Student *s);
+void calculate_and_update_cgpa_for_student(int idx);
 
-/* save_data is defined in student_system.c */
-extern void save_data(void);
+/* New helpers */
+static int subject_semester(const char *sname);
+static void populate_random_results(Student *s);
 
-/* filesystem helper */
-static void ensure_reports_dir(void) {
-    struct stat st;
-    if (stat("reports", &st) == -1) {
-        mkdir("reports", 0755);
-    }
+/* ---------- Utility ---------- */
+void safe_strncpy(char *dst, const char *src, size_t n) {
+    if (!dst) return;
+    if (!src) { dst[0] = '\0'; return; }
+    strncpy(dst, src, n-1);
+    dst[n-1] = '\0';
 }
 
-/* tiny url-decode inplace */
-static void urldecode_inplace(char *s) {
-    char *d = s;
-    while (*s) {
-        if (*s == '+') { *d++ = ' '; s++; }
-        else if (*s == '%' && isxdigit((unsigned char)s[1]) && isxdigit((unsigned char)s[2])) {
-            char hex[3] = { s[1], s[2], 0 };
-            *d++ = (char)strtol(hex, NULL, 16);
-            s += 3;
-        } else {
-            *d++ = *s++;
+static void clear_stdin(void) {
+    int c;
+    while ((c = getchar()) != '\n' && c != EOF) {}
+}
+
+static void pause_console(void) {
+    printf("\nPress Enter to continue...");
+    getchar();
+}
+
+static void to_lower_str(char *s) {
+    for (; *s; ++s) *s = (char)tolower((unsigned char)*s);
+}
+
+/* ---------- Semester subjects data ---------- */
+/* For each semester we define an array of subject names and credits.
+   The lists are taken (and normalized) from the user's input.
+*/
+static const char *sem_subjects[][20] = {
+    { NULL },
+    {
+        "Programming in C",
+        "Linux Lab",
+        "Problem Solving",
+        "Advanced Engineering Mathematics - I",
+        "Physics for Computer Engineers",
+        "Managing Self",
+        "Environmental Sustainability and Climate Change",
+        NULL
+    },
+    {
+        "Data Structures and Algorithms",
+        "Digital Electronics",
+        "Python Programming",
+        "Advanced Engineering Mathematics - II",
+        "Environmental Sustainability and Climate Change",
+        "Time and Priority Management",
+        "Elements of AI/ML",
+        NULL
+    },
+    {
+        "Leading Conversations",
+        "Discrete Mathematical Structures",
+        "Operating Systems",
+        "Elements of AI/ML",
+        "Database Management Systems",
+        "Design and Analysis of Algorithms",
+        NULL
+    },
+    {
+        "Software Engineering",
+        "EDGE - Soft Skills",
+        "Linear Algebra",
+        "Indian Constitution",
+        "Writing with Impact",
+        "Object Oriented Programming",
+        "Data Communication and Networks",
+        "Applied Machine Learning",
+        NULL
+    },
+    {
+        "Cryptography and Network Security",
+        "Formal Languages and Automata Theory",
+        "Object Oriented Analysis and Design",
+        "Exploratory-3",
+        "Start your Startup",
+        "Research Methodology in CS",
+        "Probability, Entropy, and MC Simulation",
+        "PE-2",
+        "PE-2 Lab",
+        NULL
+    },
+    {
+        "Exploratory-4",
+        "Leadership and Teamwork",
+        "Compiler Design",
+        "Statistics and Data Analysis",
+        "PE-3",
+        "PE-3 Lab",
+        "Minor Project",
+        NULL
+    },
+    {
+        "Exploratory-5",
+        "PE-4",
+        "PE-4 Lab",
+        "PE-5",
+        "PE-5 Lab",
+        "Capstone Project - Phase-1",
+        "Summer Internship",
+        NULL
+    },
+    {
+        "IT Ethical Practices",
+        "Capstone Project - Phase-2",
+        NULL
+    }
+};
+
+/* Corresponding credits */
+static const int sem_credits[][20] = {
+    { 0 },
+    { 5, 2, 2, 4, 5, 2, 2, 0 },
+    { 5, 3, 5, 4, 2, 2, 3, 0 },
+    { 2, 3, 3, 3, 5, 4, 0 },
+    { 3, 0, 3, 0, 2, 4, 4, 5, 0 },
+    { 3, 3, 3, 3, 2, 3, 3, 4, 1, 0 },
+    { 3, 2, 3, 3, 4, 1, 5, 0 },
+    { 3, 4, 1, 3, 1, 5, 1, 0 },
+    { 3, 5, 0 }
+};
+
+/* helper to append semester subjects 1..sem into student subject list (avoids duplicates) */
+static void add_semesters_to_student(Student *s, int sem) {
+    if (!s) return;
+    for (int cur = 1; cur <= sem && cur <= 8; ++cur) {
+        const char **list = sem_subjects[cur];
+        if (!list) continue;
+        for (int j = 0; list[j] != NULL; ++j) {
+            /* check if subject already present (case-sensitive compare on exact name) */
+            int found = 0;
+            for (int k = 0; k < s->num_subjects; ++k) {
+                if (strcmp(s->subjects[k].name, list[j]) == 0) { found = 1; break; }
+            }
+            if (found) continue;
+            if (s->num_subjects >= MAX_SUBJECTS) break;
+            safe_strncpy(s->subjects[s->num_subjects].name, list[j], sizeof(s->subjects[s->num_subjects].name));
+            /* lookup credit if available */
+            int credit = 0;
+            if (cur >= 1 && cur <= 8) {
+                credit = sem_credits[cur][j];
+            }
+            s->subjects[s->num_subjects].credits = credit;
+            s->subjects[s->num_subjects].marks = 0;
+            s->subjects[s->num_subjects].classes_held = 0;
+            s->subjects[s->num_subjects].classes_attended = 0;
+            s->num_subjects++;
         }
     }
-    *d = 0;
 }
 
-/* parse application/x-www-form-urlencoded body for key (returns malloc'd string or NULL) */
-static char *form_value(const char *body, const char *key) {
-    size_t k = strlen(key);
-    const char *p = body;
-    while (*p) {
-        const char *eq = strchr(p, '=');
-        const char *amp = strchr(p, '&');
-        if (!eq) break;
-        size_t name_len = (amp ? (size_t)(eq - p) : (size_t)(eq - p));
-        if (name_len == k && strncmp(p, key, k) == 0) {
-            const char *val_start = eq + 1;
-            const char *val_end = amp ? amp : (p + strlen(p));
-            size_t vlen = val_end - val_start;
-            char *out = malloc(vlen + 1);
-            if (!out) return NULL;
-            memcpy(out, val_start, vlen);
-            out[vlen] = 0;
-            urldecode_inplace(out);
-            return out;
+/* ---------- File operations ---------- */
+void load_data(void) {
+    FILE *fp = fopen(DATA_FILE, "rb");
+    if (!fp) {
+        student_count = 0;
+        for (int i = 0; i < MAX_STUDENTS; ++i) students[i].exists = 0;
+        return;
+    }
+    if (fread(&student_count, sizeof(student_count), 1, fp) != 1) {
+        fclose(fp);
+        student_count = 0;
+        for (int i = 0; i < MAX_STUDENTS; ++i) students[i].exists = 0;
+        return;
+    }
+    if (student_count < 0 || student_count > MAX_STUDENTS) student_count = 0;
+    if (fread(students, sizeof(Student), student_count, fp) < (size_t)student_count) {
+        /* tolerate truncated file */
+    }
+    fclose(fp);
+}
+
+void save_data(void) {
+    FILE *fp = fopen(DATA_FILE, "wb");
+    if (!fp) {
+        perror("Unable to save data");
+        return;
+    }
+    if (fwrite(&student_count, sizeof(student_count), 1, fp) != 1) {
+        perror("Unable to write header");
+        fclose(fp);
+        return;
+    }
+    if (student_count > 0) {
+        if (fwrite(students, sizeof(Student), student_count, fp) != (size_t)student_count) {
+            perror("Unable to write records");
         }
-        if (!amp) break;
-        p = amp + 1;
     }
-    return NULL;
+    fclose(fp);
 }
 
-/* html escape small function */
-static void html_escape_buf(const char *in, char *out, size_t outcap) {
-    size_t j = 0;
-    for (size_t i = 0; in[i] && j + 7 < outcap; ++i) {
-        char c = in[i];
-        if (c == '&') { strcpy(out + j, "&amp;"); j += 5; }
-        else if (c == '<') { strcpy(out + j, "&lt;"); j += 4; }
-        else if (c == '>') { strcpy(out + j, "&gt;"); j += 4; }
-        else if (c == '"') { strcpy(out + j, "&quot;"); j += 6; }
-        else out[j++] = c;
+/* ---------- Helpers ---------- */
+
+int find_index_by_id(int id) {
+    for (int i = 0; i < student_count; ++i) {
+        if (students[i].exists && students[i].id == id) return i;
     }
-    out[j] = 0;
+    return -1;
 }
 
-/* quick grade mapping */
-static int marks_to_grade_point_local(int marks) {
+int next_free_spot(void) {
+    for (int i = 0; i < student_count; ++i) {
+        if (!students[i].exists) return i;
+    }
+    if (student_count < MAX_STUDENTS) {
+        students[student_count].exists = 0;
+        return student_count++;
+    }
+    return -1;
+}
+
+int generate_unique_id(void) {
+    int id = 1001;
+    while (find_index_by_id(id) != -1) id++;
+    return id;
+}
+
+int find_duplicate_by_details(const char *name, const char *dept, int year) {
+    char name_low[MAX_NAME], dept_low[MAX_NAME];
+    safe_strncpy(name_low, name, sizeof(name_low));
+    safe_strncpy(dept_low, dept, sizeof(dept_low));
+    to_lower_str(name_low); to_lower_str(dept_low);
+    for (int i = 0; i < student_count; ++i) {
+        if (!students[i].exists) continue;
+        char other_name[MAX_NAME], other_dept[MAX_NAME];
+        safe_strncpy(other_name, students[i].name, sizeof(other_name));
+        safe_strncpy(other_dept, students[i].dept, sizeof(other_dept));
+        to_lower_str(other_name); to_lower_str(other_dept);
+        if (strcmp(name_low, other_name) == 0 && strcmp(dept_low, other_dept) == 0 && students[i].year == year) return i;
+    }
+    return -1;
+}
+
+/* ---------- SGPA/CGPA ---------- */
+static int marks_to_grade_point(int marks) {
     if (marks >= 90) return 10;
     if (marks >= 80) return 9;
     if (marks >= 70) return 8;
@@ -146,924 +327,788 @@ static int marks_to_grade_point_local(int marks) {
     return 0;
 }
 
-/* compute SGPA locally (used as fallback) */
-static double compute_sgpa_local(const Student *s) {
+double calculate_sgpa_for_student(Student *s) {
     int total_credits = 0;
-    double weighted = 0.0;
+    double weighted_sum = 0.0;
     for (int i = 0; i < s->num_subjects; ++i) {
         int cr = s->subjects[i].credits;
         int mk = s->subjects[i].marks;
         if (cr <= 0) continue;
-        int gp = marks_to_grade_point_local(mk);
-        weighted += (double)gp * cr;
+        int gp = marks_to_grade_point(mk);
+        weighted_sum += (double)gp * cr;
         total_credits += cr;
     }
     if (total_credits == 0) return 0.0;
-    return weighted / (double)total_credits;
+    return weighted_sum / (double)total_credits;
 }
 
-/* helper to slugify subject for filename */
-static void slugify(const char *in, char *out, size_t outcap) {
-    size_t j=0;
-    for (size_t i=0; in[i] && j+1<outcap; ++i) {
-        char c = in[i];
-        if (isalnum((unsigned char)c)) out[j++]=tolower(c);
-        else if (c==' '||c=='_'||c=='-') {
-            if (j>0 && out[j-1]!='-') out[j++]='-';
-        }
-    }
-    if (j>0 && out[j-1]=='-') j--;
-    out[j]=0;
-}
-
-/* helper to add an array of subjects to a student */
-static void add_subjects_to_student(Student *s, const char **list, const int *credits) {
-    if (!s || !list) return;
-    for (int i = 0; list[i] != NULL; ++i) {
-        /* skip duplicates */
-        int found = 0;
-        for (int k = 0; k < s->num_subjects; ++k) {
-            if (strcmp(s->subjects[k].name, list[i]) == 0) { found = 1; break; }
-        }
-        if (found) continue;
-        if (s->num_subjects >= MAX_SUBJECTS) break;
-        strncpy(s->subjects[s->num_subjects].name, list[i], sizeof(s->subjects[s->num_subjects].name)-1);
-        s->subjects[s->num_subjects].name[sizeof(s->subjects[s->num_subjects].name)-1] = '\0';
-        s->subjects[s->num_subjects].credits = credits ? credits[i] : 0;
-        s->subjects[s->num_subjects].marks = 0;
-        s->subjects[s->num_subjects].classes_held = 0;
-        s->subjects[s->num_subjects].classes_attended = 0;
-        s->num_subjects++;
-    }
-}
-
-/* semester definitions (copied to keep semester->subject mapping) */
-static const char *sem1[] = {
-    "Programming in C","Linux Lab","Problem Solving","Advanced Engineering Mathematics - I","Physics for Computer Engineers","Managing Self","Environmental Sustainability and Climate Change", NULL
-};
-static const int sem1_c[] = {5,2,2,4,5,2,2};
-static const char *sem2[] = {
-    "Data Structures and Algorithms","Digital Electronics","Python Programming","Advanced Engineering Mathematics - II","Environmental Sustainability and Climate Change","Time and Priority Management","Elements of AI/ML", NULL
-};
-static const int sem2_c[] = {5,3,5,4,2,2,3};
-static const char *sem3[] = {
-    "Leading Conversations","Discrete Mathematical Structures","Operating Systems","Elements of AI/ML","Database Management Systems","Design and Analysis of Algorithms", NULL
-};
-static const int sem3_c[] = {2,3,3,3,5,4};
-static const char *sem4[] = {
-    "Software Engineering","EDGE - Soft Skills","Linear Algebra","Indian Constitution","Writing with Impact","Object Oriented Programming","Data Communication and Networks","Applied Machine Learning", NULL
-};
-static const int sem4_c[] = {3,0,3,0,2,4,4,5};
-static const char *sem5[] = {
-    "Cryptography and Network Security","Formal Languages and Automata Theory","Object Oriented Analysis and Design","Exploratory-3","Start your Startup","Research Methodology in CS","Probability, Entropy, and MC Simulation","PE-2","PE-2 Lab", NULL
-};
-static const int sem5_c[] = {3,3,3,3,2,3,3,4,1};
-static const char *sem6[] = {
-    "Exploratory-4","Leadership and Teamwork","Compiler Design","Statistics and Data Analysis","PE-3","PE-3 Lab","Minor Project", NULL
-};
-static const int sem6_c[] = {3,2,3,3,4,1,5};
-static const char *sem7[] = {
-    "Exploratory-5","PE-4","PE-4 Lab","PE-5","PE-5 Lab","Capstone Project - Phase-1","Summer Internship", NULL
-};
-static const int sem7_c[] = {3,4,1,3,1,5,1};
-static const char *sem8[] = {
-    "IT Ethical Practices","Capstone Project - Phase-2", NULL
-};
-static const int sem8_c[] = {3,5};
-
-/* determine semester index for a subject name by searching the semester arrays above
-   returns 1..8 if found, 0 if unknown */
-static int subject_semester(const char *sname) {
-    const char **lists[] = { NULL, sem1, sem2, sem3, sem4, sem5, sem6, sem7, sem8 };
-    for (int sem=1; sem<=8; ++sem) {
-        const char **lst = lists[sem];
-        if (!lst) continue;
-        for (int j=0; lst[j]!=NULL; ++j) {
-            if (strcmp(lst[j], sname) == 0) return sem;
-        }
-    }
-    return 0;
-}
-
-/* Build landing page (signup includes extra fields) */
-static char *build_landing_page(void) {
-    ensure_reports_dir();
-    const char *html_start =
-        "<!doctype html><html><head><meta charset='utf-8'><title>Student System</title>"
-        "<meta name='viewport' content='width=device-width,initial-scale=1'/>"
-        "<style>"
-        "body{margin:0;font-family:Inter,Arial,Helvetica,sans-serif;background:linear-gradient(135deg,#f0f6ff 0%,#ffffff 40%,#f7f2ff 100%);min-height:100vh;display:flex;align-items:center;justify-content:center}"
-        ".wrap{max-width:1100px;width:95%;margin:40px auto;background:rgba(255,255,255,0.95);border-radius:12px;padding:26px;box-shadow:0 8px 28px rgba(20,20,50,0.08)}"
-        "h1{margin:0;font-size:28px;color:#12263a} p.lead{color:#4b5563}"
-        ".grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:16px;margin-top:18px}"
-        ".card{background:#fff;border-radius:10px;padding:18px;border:1px solid rgba(20,20,60,0.04)}"
-        ".card h3{margin:0 0 8px 0} .card p{margin:0 0 12px 0;color:#333}"
-        "input,textarea,button,select{width:100%;padding:8px;border-radius:6px;border:1px solid #e6eef8;font-size:14px}"
-        "button{cursor:pointer;background:linear-gradient(180deg,#2b6ef6,#215bd6);color:white;border:none;padding:10px 12px}"
-        ".small{font-size:13px;color:#6b7280} .muted{color:#6b7280;font-size:13px;margin-top:8px}"
-        "@media(max-width:600px){.wrap{padding:14px}}"
-        "</style></head><body><div class='wrap'>"
-        "<h1>Student Record & Result Management</h1>"
-        "<p class='lead'>Choose an option to continue — Admin login, Student sign up, or Student sign in.</p>"
-        "<div class='grid'>";
-
-    const char *admin_card =
-        "<div class='card'>"
-        "<h3>Admin Login</h3>"
-        "<p>Full admin control: manage students, marks, attendance.</p>"
-        "<form method='post' action='/admin-login'>"
-        "<input name='username' placeholder='Admin username' required />"
-        "<input name='password' placeholder='Admin password' type='password' required />"
-        "<div style='margin-top:8px'><button>Login as Admin</button></div>"
-        "</form>"
-        "</div>";
-
-    const char *signup_card =
-        "<div class='card'>"
-        "<h3>Student Sign Up</h3>"
-        "<p>Register (semester subjects will be added automatically).</p>"
-        "<form method='post' action='/student-signup'>"
-        "<input name='name' placeholder='Full Name' required />"
-        "<input name='age' placeholder='Age' required />"
-        "<input name='sap_id' placeholder='SAP ID (numeric)' required />"
-        "<input name='email' placeholder='Email' required />"
-        "<input name='phone' placeholder='Phone' required />"
-        "<select name='semester' required>"
-        "<option value='1'>Semester 1</option>"
-        "<option value='2'>Semester 2</option>"
-        "<option value='3'>Semester 3</option>"
-        "<option value='4'>Semester 4</option>"
-        "<option value='5'>Semester 5</option>"
-        "<option value='6'>Semester 6</option>"
-        "<option value='7'>Semester 7</option>"
-        "<option value='8'>Semester 8</option>"
-        "</select>"
-        "<input name='password' placeholder='Password' type='password' required />"
-        "<div style='margin-top:8px'><button>Sign Up</button></div>"
-        "</form>"
-        "<p class='muted'>Use your SAP ID and password to sign in after registration.</p>"
-        "</div>";
-
-    const char *signin_card =
-        "<div class='card'>"
-        "<h3>Student Sign In</h3>"
-        "<p>Sign in to view your dashboard (attendance, marks, SGPA, CGPA).</p>"
-        "<form method='get' action='/dashboard'>"
-        "<input name='id' placeholder='Student ID' required />"
-        "<input name='pass' placeholder='Password' type='password' required />"
-        "<div style='margin-top:8px'><button>Sign in</button></div>"
-        "</form>"
-        "</div>";
-
-    const char *footer = "</div><p class='small'>Demo by Tanay Sah & Mahika Jaglan — for demonstration only.</p></div></body></html>";
-
-    size_t cap = strlen(html_start) + strlen(admin_card) + strlen(signup_card) + strlen(signin_card) + strlen(footer) + 256;
-    char *buf = malloc(cap);
-    if (!buf) return NULL;
-    strcpy(buf, html_start);
-    strcat(buf, admin_card);
-    strcat(buf, signup_card);
-    strcat(buf, signin_card);
-    strcat(buf, footer);
-    return buf;
-}
-
-/* send text/html response */
-static void send_text(int client, const char *status, const char *ctype, const char *body) {
-    char header[512];
-    int hlen = snprintf(header, sizeof(header),
-                        "HTTP/1.1 %s\r\nContent-Type: %s\r\nContent-Length: %zu\r\nConnection: close\r\n\r\n",
-                        status, ctype, strlen(body));
-    send(client, header, hlen, 0);
-    send(client, body, strlen(body), 0);
-}
-
-/* Read request (headers and body) into buffer (simple) */
-#define REQBUF 262144
-static int read_request(int client, char *buf, int bufsz) {
-    int total = 0, r;
-    while ((r = recv(client, buf + total, bufsz - total - 1, 0)) > 0) {
-        total += r;
-        if (total > 4 && strstr(buf, "\r\n\r\n")) break;
-        if (total > bufsz - 100) break;
-    }
-    if (r <= 0 && total == 0) return -1;
-    buf[total] = 0;
-    /* if Content-Length present, ensure body fully read */
-    char *cl = strcasestr(buf, "Content-Length:");
-    if (cl) {
-        int clv = atoi(cl + strlen("Content-Length:"));
-        char *hdr_end = strstr(buf, "\r\n\r\n");
-        int bodylen = hdr_end ? (int)strlen(hdr_end + 4) : 0;
-        int toread = clv - bodylen;
-        while (toread > 0 && (r = recv(client, buf + total, bufsz - total - 1, 0)) > 0) {
-            total += r;
-            toread -= r;
-        }
-        buf[total] = 0;
-    }
-    return total;
-}
-
-/* Serve a static report file from reports/ */
-static void serve_report_file(int client, const char *name) {
-    if (strstr(name, "..")) {
-        const char *bad = "HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain\r\nContent-Length:11\r\n\r\nBad request";
-        send(client, bad, strlen(bad), 0);
-        return;
-    }
-    char path[PATH_MAX];
-    snprintf(path, sizeof(path), "reports/%s", name);
-    FILE *f = fopen(path, "rb");
-    if (!f) {
-        const char *notf = "HTTP/1.1 404 Not Found\r\nContent-Type: text/plain\r\nContent-Length:9\r\n\r\nNot found";
-        send(client, notf, strlen(notf), 0);
-        return;
-    }
-    fseek(f, 0, SEEK_END);
-    long sz = ftell(f);
-    fseek(f, 0, SEEK_SET);
-    char *data = malloc(sz + 1);
-    if (!data) { fclose(f); const char *err = "HTTP/1.1 500 Internal\r\n\r\n"; send(client, err, strlen(err), 0); return; }
-    fread(data, 1, sz, f);
-    data[sz] = 0;
-    fclose(f);
-    char header[256];
-    int hlen = snprintf(header, sizeof(header), "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: %ld\r\nConnection: close\r\n\r\n", sz);
-    send(client, header, hlen, 0);
-    send(client, data, sz, 0);
-    free(data);
-}
-
-/* build simple student list HTML (used for admin to choose subject for attendance etc.) */
-static char *build_list_html(void) {
-    size_t cap = 8192;
-    char *buf = malloc(cap);
-    if (!buf) return NULL;
-    strcpy(buf, "<!doctype html><html><head><meta charset='utf-8'><title>Students</title></head><body><h2>Students</h2><table border='1' cellpadding='6'><tr><th>ID</th><th>Name</th><th>Year</th><th>Dept</th><th>Sem</th></tr>");
-    for (int i = 0; i < student_count; ++i) {
-        if (!students[i].exists) continue;
-        char row[1024];
-        snprintf(row, sizeof(row), "<tr><td>%d</td><td>%s</td><td>%d</td><td>%s</td><td>%d</td></tr>", students[i].id, students[i].name, students[i].year, students[i].dept, students[i].current_semester);
-        if (strlen(buf) + strlen(row) + 256 > cap) { cap *= 2; buf = realloc(buf, cap); }
-        strcat(buf, row);
-    }
-    strcat(buf, "</table><p><a href='/'>Back</a></p></body></html>");
-    return buf;
-}
-
-/* build student dashboard as HTML with attendance & marks grouped by semester (latest on top) */
-static char *build_student_dashboard(int idx) {
-    if (idx < 0 || idx >= student_count) return NULL;
+/* New: recompute CGPA over ALL subjects (idempotent & correct) */
+void calculate_and_update_cgpa_for_student(int idx) {
+    if (idx < 0 || idx >= student_count) return;
     Student *s = &students[idx];
-    char escaped_name[256]; html_escape_buf(s->name, escaped_name, sizeof(escaped_name));
-
-    /* Organize subjects by semester */
-    /* We'll create a simple buffer per semester */
-    char sem_bufs[9][8192];
-    for (int i=0;i<9;++i) sem_bufs[i][0]=0;
+    int total_credits = 0;
+    double total_weighted = 0.0;
     for (int i = 0; i < s->num_subjects; ++i) {
-        int sem = subject_semester(s->subjects[i].name);
-        if (sem < 1 || sem > 8) sem = 0; /* unknown => group 0 (we'll show later) */
-        char sname_esc[256]; html_escape_buf(s->subjects[i].name, sname_esc, sizeof(sname_esc));
-        int held = s->subjects[i].classes_held;
-        int att = s->subjects[i].classes_attended;
-        int pct = (held == 0) ? 0 : (int)(((double)att / held) * 100.0 + 0.5);
-        int marks = s->subjects[i].marks;
-        double gp = (s->subjects[i].credits>0)? marks_to_grade_point_local(marks) : 0;
-        char row[512];
-        snprintf(row, sizeof(row), "<tr><td>%s</td><td>%d</td><td>%d</td><td>%.0f</td><td>%d%%</td></tr>", sname_esc, s->subjects[i].credits, marks, gp, pct);
-        if (sem >=1 && sem <=8) {
-            if (strlen(sem_bufs[sem]) + strlen(row) + 256 > sizeof(sem_bufs[sem])) continue;
-            strcat(sem_bufs[sem], row);
-        } else {
-            if (strlen(sem_bufs[0]) + strlen(row) + 256 > sizeof(sem_bufs[0])) continue;
-            strcat(sem_bufs[0], row);
-        }
-    }
-
-    /* compute SGPA for current semester only */
-    double sgpa_current = 0.0;
-    int tot_cr = 0;
-    double weighted = 0.0;
-    for (int i=0;i<s->num_subjects;++i) {
-        int sem = subject_semester(s->subjects[i].name);
-        if (sem != s->current_semester) continue;
         int cr = s->subjects[i].credits;
-        if (cr <= 0) continue;
         int mk = s->subjects[i].marks;
-        int gp = marks_to_grade_point_local(mk);
-        weighted += (double)gp * cr;
-        tot_cr += cr;
+        if (cr <= 0) continue;
+        int gp = marks_to_grade_point(mk);
+        total_weighted += (double)gp * cr;
+        total_credits += cr;
     }
-    if (tot_cr > 0) sgpa_current = weighted / (double)tot_cr;
-
-    const char *tpl_start =
-        "<!doctype html><html><head><meta charset='utf-8'><title>Dashboard</title>"
-        "<meta name='viewport' content='width=device-width,initial-scale=1'/>"
-        "<style>body{font-family:Inter,Arial;margin:18px} .card{background:#fff;padding:18px;border-radius:10px;box-shadow:0 6px 18px rgba(0,0,0,0.06);max-width:1000px;margin:auto} table{width:100%;border-collapse:collapse} table th,table td{padding:8px;border:1px solid #eee;text-align:left;font-size:14px} h3.sem{margin-top:18px}</style>"
-        "</head><body><div class='card'>";
-
-    const char *tpl_end = "<p><a href='/'>← Back to Home</a></p></div></body></html>";
-
-    size_t cap = strlen(tpl_start) + 32768;
-    char *buf = malloc(cap);
-    if (!buf) return NULL;
-    strcpy(buf, tpl_start);
-    char header[1024];
-    char dept_esc[256]; html_escape_buf(s->dept, dept_esc, sizeof(dept_esc));
-    snprintf(header, sizeof(header),
-             "<h2>Welcome, %s</h2><p>ID: %d | Dept: %s | Year: %d | Current Semester: %d | Age: %d</p>"
-             "<p><strong>SGPA (current sem %d):</strong> %.3f  &nbsp;&nbsp; <strong>Stored CGPA:</strong> %.3f (Credits: %d)</p>",
-             escaped_name, s->id, dept_esc, s->year, s->current_semester, s->age, s->current_semester, sgpa_current, s->cgpa, s->total_credits_completed);
-    strcat(buf, header);
-
-    /* Show current semester subjects first */
-    for (int sem = s->current_semester; sem >= 1; --sem) {
-        char title[128];
-        snprintf(title, sizeof(title), "<h3 class='sem'>Semester %d</h3>", sem);
-        strcat(buf, title);
-        strcat(buf, "<table><tr><th>Subject</th><th>Credits</th><th>Marks</th><th>GradePoint</th><th>Attendance</th></tr>");
-        if (sem_bufs[sem][0] == '\0') {
-            strcat(buf, "<tr><td colspan='5'>No subjects for this semester.</td></tr>");
-        } else {
-            strcat(buf, sem_bufs[sem]);
-        }
-        strcat(buf, "</table>");
+    if (total_credits > 0) {
+        s->cgpa = total_weighted / (double)total_credits;
+        s->total_credits_completed = total_credits;
+    } else {
+        s->cgpa = 0.0;
+        s->total_credits_completed = 0;
     }
-    /* Show unknown-grouped subjects (if any) */
-    if (sem_bufs[0][0]) {
-        strcat(buf, "<h3 class='sem'>Other / Uncategorized Subjects</h3><table><tr><th>Subject</th><th>Credits</th><th>Marks</th><th>GradePoint</th><th>Attendance</th></tr>");
-        strcat(buf, sem_bufs[0]);
-        strcat(buf, "</table>");
-    }
-
-    strcat(buf, tpl_end);
-    return buf;
+    save_data();
+    /* Print a line for console logs */
+    double sgpa = calculate_sgpa_for_student(s);
+    printf("Recomputed for student %d (%s): SGPA(all-subjects-view): %.3f, CGPA: %.3f (Credits: %d)\n", s->id, s->name, sgpa, s->cgpa, s->total_credits_completed);
 }
 
-/* handle a client connection */
-static void handle_client(int client) {
-    char req[REQBUF];
-    int r = read_request(client, req, sizeof(req));
-    if (r <= 0) { close(client); return; }
+/* ---------- Reports (HTML) ---------- */
 
-    char method[8] = {0}, fullpath[1024] = {0}, proto[32] = {0};
-    sscanf(req, "%7s %1023s %31s", method, fullpath, proto);
+static void html_escape(FILE *f, const char *s) {
+    for (; *s; ++s) {
+        if (*s == '&') fputs("&amp;", f);
+        else if (*s == '<') fputs("&lt;", f);
+        else if (*s == '>') fputs("&gt;", f);
+        else if (*s == '"') fputs("&quot;", f);
+        else fputc(*s, f);
+    }
+}
 
-    /* separate path and query */
-    char path[1024]; strcpy(path, fullpath);
-    char *qmark = strchr(path, '?');
-    if (qmark) *qmark = 0;
+void generate_html_report(int idx, const char* college, const char* semester, const char* exam) {
+    if (idx < 0 || idx >= student_count) return;
+    Student *s = &students[idx];
+    MKDIR(REPORTS_DIR);
+    char path[512];
+    snprintf(path, sizeof(path), "%s/%d_result.html", REPORTS_DIR, s->id);
+    FILE *f = fopen(path, "w");
+    if (!f) {
+        perror("Unable to create report file");
+        return;
+    }
+    time_t t = time(NULL);
+    struct tm tm = *localtime(&t);
+    char datebuf[64];
+    snprintf(datebuf, sizeof(datebuf), "%04d-%02d-%02d", tm.tm_year+1900, tm.tm_mon+1, tm.tm_mday);
 
-    /* GET handlers */
-    if (strcmp(method, "GET") == 0) {
-        if (strncmp(path, "/reports/", 9) == 0) {
-            const char *fname = path + 9;
-            while (*fname == '/') fname++;
-            serve_report_file(client, fname);
-            close(client); return;
+    fprintf(f, "<!doctype html>\n<html>\n<head>\n<meta charset='utf-8'>\n");
+    fprintf(f, "<title>Result - %d - %s</title>\n", s->id, s->name);
+    fprintf(f, "<style>@page{size:A4;margin:20mm} body{font-family:Arial;font-size:12px} .table{width:100%%;border-collapse:collapse} .table th,.table td{border:1px solid #333;padding:6px;text-align:left}</style>\n");
+    fprintf(f, "</head>\n<body>\n");
+    fprintf(f, "<h2>");
+    html_escape(f, college ? college : "Your College");
+    fprintf(f, "</h2>\n");
+    fprintf(f, "<p><strong>Student:</strong> "); html_escape(f, s->name); fprintf(f, "<br>\n");
+    fprintf(f, "<strong>ID:</strong> %d<br>\n", s->id);
+    fprintf(f, "<strong>Dept:</strong> "); html_escape(f, s->dept); fprintf(f, "<br>\n");
+    fprintf(f, "<strong>Year:</strong> %d<br>\n", s->year);
+    fprintf(f, "<strong>Semester:</strong> "); html_escape(f, semester ? semester : "Semester -"); fprintf(f, "<br>\n");
+    fprintf(f, "<strong>Exam:</strong> "); html_escape(f, exam ? exam : "Exam -"); fprintf(f, "<br>\n");
+    fprintf(f, "<strong>Date:</strong> %s</p>\n", datebuf);
+
+    fprintf(f, "<table class='table'><tr><th>#</th><th>Subject</th><th>Marks</th><th>Credits</th><th>Grade Point</th></tr>\n");
+    for (int i = 0; i < s->num_subjects; ++i) {
+        int gp = marks_to_grade_point(s->subjects[i].marks);
+        fprintf(f, "<tr><td>%d</td><td>", i+1);
+        html_escape(f, s->subjects[i].name);
+        fprintf(f, "</td><td>%d</td><td>%d</td><td>%d</td></tr>\n", s->subjects[i].marks, s->subjects[i].credits, gp);
+    }
+    double sgpa = calculate_sgpa_for_student(s);
+    fprintf(f, "</table>\n<p><strong>SGPA (all subjects view):</strong> %.3f<br>\n<strong>CGPA:</strong> %.3f<br>\n<strong>Total Credits Counted:</strong> %d</p>\n", sgpa, s->cgpa, s->total_credits_completed);
+    fprintf(f, "</body>\n</html>\n");
+    fclose(f);
+}
+
+/* ---------- CRUD / Menus (interactive) ---------- */
+
+void print_student_short(Student *s) {
+    printf("ID: %d | Name: %s | Year: %d | Dept: %s | Sem: %d\n", s->id, s->name, s->year, s->dept, s->current_semester);
+}
+
+void print_student_full(Student *s) {
+    printf("------------- Student Profile -------------\n");
+    printf("ID        : %d\nName      : %s\nAge       : %d\nEmail     : %s\nPhone     : %s\nDepartment: %s\nYear      : %d\nSemester  : %d\nSubjects  : %d\n",
+           s->id, s->name, s->age, s->email, s->phone, s->dept, s->year, s->current_semester, s->num_subjects);
+    for (int i = 0; i < s->num_subjects; ++i) {
+        Subject *sub = &s->subjects[i];
+        int held = sub->classes_held, att = sub->classes_attended;
+        double pct = (held == 0) ? 0.0 : ((double)att / held) * 100.0;
+        printf("  %d) %s - Attended %d / %d (%.2f%%) | Marks: %d | Credits: %d\n",
+               i+1, sub->name, att, held, pct, sub->marks, sub->credits);
+    }
+    double sgpa = calculate_sgpa_for_student(s);
+    printf("Current semester SGPA: %.3f\nStored CGPA: %.3f (Credits: %d)\n", sgpa, s->cgpa, s->total_credits_completed);
+    printf("-------------------------------------------\n");
+}
+
+/* add student: accepts fully-initialized Student (id may be 0 => auto-gen) */
+void add_student_custom(Student *s) {
+    if (!s) return;
+    /* If an explicit non-zero id is provided, reject if duplicate */
+    if (s->id != 0) {
+        if (find_index_by_id(s->id) != -1) {
+            printf("Student with ID %d already exists. Aborting add.\n", s->id);
+            return;
         }
-        if (strcmp(path, "/") == 0) {
-            char *page = build_landing_page();
-            if (!page) send_text(client, "500 Internal Server Error", "text/plain", "Server error");
-            else { send_text(client, "200 OK", "text/html; charset=utf-8", page); free(page); }
-            close(client); return;
-        }
-        if (strncmp(path, "/list", 5) == 0) {
-            char *page = build_list_html();
-            if (!page) send_text(client, "500 Internal Server Error", "text/plain", "Server error");
-            else { send_text(client, "200 OK", "text/html; charset=utf-8", page); free(page); }
-            close(client); return;
-        }
-        if (strncmp(path, "/dashboard", 10) == 0) {
-            /* parse query string after ? */
-            char *q = strchr(fullpath, '?');
-            int id = -1; char pass[128] = {0};
-            if (q) {
-                char *qs = strdup(q+1);
-                char *v = form_value(qs, "id");
-                char *p = form_value(qs, "pass");
-                if (v) { id = atoi(v); free(v); }
-                if (p) { strncpy(pass, p, sizeof(pass)-1); free(p); }
-                free(qs);
-            }
-            if (id <= 0 || pass[0]==0) {
-                send_text(client, "400 Bad Request", "text/plain", "Missing id or pass (use the sign-in form).");
-                close(client); return;
-            }
-            int idx = api_find_index_by_id(id);
-            if (idx == -1) { send_text(client, "404 Not Found", "text/plain", "Student not found"); close(client); return; }
-            if (strcmp(pass, students[idx].password) != 0) { send_text(client, "401 Unauthorized", "text/plain", "Wrong password"); close(client); return; }
-            char *page = build_student_dashboard(idx);
-            if (!page) send_text(client, "500 Internal Server Error", "text/plain", "Server error");
-            else { send_text(client, "200 OK", "text/html; charset=utf-8", page); free(page); }
-            close(client); return;
-        }
-        if (strncmp(path, "/attendance", 10) == 0) {
-            /* show form to mark attendance for a subject (admin-only page)
-               flow:
-               - GET /attendance -> semester select
-               - GET /attendance?semester=N -> show subjects in that semester (radio)
-               - GET /attendance?semester=N&subject=Name -> show students (filtered by current_semester == N) with checkboxes
-            */
-            char *q = strchr(fullpath, '?');
-            int sem = 0;
-            char subject_q[256] = {0};
-            if (q) {
-                char *qs = strdup(q+1);
-                char *ssem = form_value(qs, "semester");
-                char *sub = form_value(qs, "subject");
-                if (ssem) { sem = atoi(ssem); free(ssem); }
-                if (sub) { strncpy(subject_q, sub, sizeof(subject_q)-1); free(sub); }
-                free(qs);
-            }
-            /* gather unique subjects for selected semester only */
-            char subjects[16384]; subjects[0]=0;
-            for (int i=0;i<student_count;++i) {
-                if (!students[i].exists) continue;
-                for (int j=0;j<students[i].num_subjects;++j) {
-                    char *sname = students[i].subjects[j].name;
-                    int ssem = subject_semester(sname);
-                    if (sem != 0 && ssem != sem) continue;
-                    if (strstr(subjects, sname)==NULL) {
-                        if (strlen(subjects)+strlen(sname)+16 > sizeof(subjects)) continue;
-                        strcat(subjects, sname);
-                        strcat(subjects, "\n");
-                    }
-                }
-            }
-            size_t cap = 32768;
-            char *buf = malloc(cap);
-            if (!buf) { send_text(client, "500 Internal Server Error", "text/plain", "Server error"); close(client); return; }
-            strcpy(buf, "<!doctype html><html><head><meta charset='utf-8'><title>Attendance</title></head><body><h2>Admin Attendance</h2>");
-            /* Semester selection form */
-            strcat(buf, "<form method='get' action='/attendance'>Select semester: <select name='semester'>");
-            for (int s=1;s<=8;++s) {
-                char opt[64];
-                snprintf(opt, sizeof(opt), "<option value='%d'%s>Semester %d</option>", s, (s==sem) ? " selected" : "", s);
-                strcat(buf, opt);
-            }
-            strcat(buf, "</select> <button>Choose</button></form><hr>");
-            /* If semester selected but subject not, list subjects as radio buttons */
-            if (sem != 0 && subject_q[0] == 0) {
-                strcat(buf, "<h3>Subjects in chosen semester</h3>");
-                if (strlen(subjects)==0) {
-                    strcat(buf, "<p>No subjects found for this semester.</p>");
-                } else {
-                    strcat(buf, "<form method='get' action='/attendance'>");
-                    char hidden[64];
-                    snprintf(hidden, sizeof(hidden), "<input type='hidden' name='semester' value='%d'/>", sem);
-                    strcat(buf, hidden);
-                    strcat(buf, "<ul>");
-                    char *copy = strdup(subjects);
-                    char *line = strtok(copy, "\n");
-                    while (line) {
-                        char esc[256]; html_escape_buf(line, esc, sizeof(esc));
-                        char li[512];
-                        snprintf(li, sizeof(li), "<li><label><input type='radio' name='subject' value=\"%s\" required/> %s</label></li>", esc, esc);
-                        strcat(buf, li);
-                        line = strtok(NULL, "\n");
-                    }
-                    free(copy);
-                    strcat(buf, "</ul><div style='margin-top:8px'><button>Open Subject</button></div></form>");
-                }
-            }
-            /* If subject selected, show student list with checkboxes but only students whose current_semester == sem */
-            if (subject_q[0]) {
-                char panel[16384]; panel[0]=0;
-                snprintf(panel, sizeof(panel), "<h3>Subject: %s (Semester %d)</h3><form method='post' action='/attendance'><input type='hidden' name='subject' value='%s'/><input type='hidden' name='semester' value='%d'/>Date (YYYY-MM-DD): <input name='date' value='", subject_q, sem, subject_q, sem);
-                time_t t = time(NULL); struct tm tm = *localtime(&t); char datebuf[32];
-                snprintf(datebuf, sizeof(datebuf), "%04d-%02d-%02d", tm.tm_year+1900, tm.tm_mon+1, tm.tm_mday);
-                strncat(panel, datebuf, sizeof(panel)-strlen(panel)-1);
-                strncat(panel, "'/> <table border='1' cellpadding='6'><tr><th>Present</th><th>ID</th><th>Name</th></tr>", sizeof(panel)-strlen(panel)-1);
-                int listed = 0;
-                for (int i=0;i<student_count;++i) {
-                    if (!students[i].exists) continue;
-                    if (students[i].current_semester != sem) continue; /* only students in selected semester */
-                    int has = 0;
-                    for (int j=0;j<students[i].num_subjects;++j) if (strcmp(students[i].subjects[j].name, subject_q)==0) { has = 1; break; }
-                    if (!has) continue;
-                    listed++;
-                    char row[512];
-                    snprintf(row, sizeof(row), "<tr><td><input type='checkbox' name='present' value='%d'/></td><td>%d</td><td>%s</td></tr>", students[i].id, students[i].id, students[i].name);
-                    if (strlen(panel)+strlen(row)+256 > sizeof(panel)) break;
-                    strcat(panel, row);
-                }
-                if (listed == 0) strcat(panel, "<tr><td colspan='3'>No students in this semester have this subject.</td></tr>");
-                strcat(panel, "</table><div style='margin-top:8px'><button>Mark Attendance</button></div></form>");
-                if (strlen(buf)+strlen(panel)+256 > cap) { cap*=2; buf=realloc(buf,cap); }
-                strcat(buf, panel);
-            }
-            strcat(buf, "<p><a href='/'>Back</a></p></body></html>");
-            send_text(client, "200 OK", "text/html; charset=utf-8", buf);
-            free(buf);
-            close(client); return;
-        }
+    }
+    int idx = next_free_spot();
+    if (idx == -1) { printf("Maximum students reached.\n"); return; }
+    if (s->id == 0) s->id = generate_unique_id();
 
-        if (strncmp(path, "/enter-marks", 12) == 0) {
-            /* GET /enter-marks?id=<id> -> show table of student's current semester subjects with mark inputs */
-            char *q = strchr(fullpath, '?');
-            int id = -1;
-            if (q) {
-                char *qs = strdup(q+1);
-                char *vid = form_value(qs, "id");
-                if (vid) { id = atoi(vid); free(vid); }
-                free(qs);
-            }
-            if (id <= 0) {
-                /* render a small page explaining how to use this endpoint */
-                const char *help = "<!doctype html><html><head><meta charset='utf-8'><title>Enter Marks</title></head><body><h3>Enter Marks</h3><p>Provide a student ID on the admin dashboard or use the dashboard form.</p><p><a href='/'>Back</a></p></body></html>";
-                send_text(client, "200 OK", "text/html; charset=utf-8", help);
-                close(client); return;
-            }
-            int idx = api_find_index_by_id(id);
-            if (idx == -1) { send_text(client, "404 Not Found", "text/plain", "Student not found"); close(client); return; }
-            Student *s = &students[idx];
-            /* Build form: table of subjects that belong to current_semester */
-            int cur = s->current_semester;
-            size_t cap = 16384;
-            char *buf = malloc(cap);
-            if (!buf) { send_text(client, "500 Internal Server Error", "text/plain", "Server error"); close(client); return; }
-            snprintf(buf, cap, "<!doctype html><html><head><meta charset='utf-8'><title>Enter Marks for %s</title></head><body><h2>Enter Marks for %s (ID: %d) - Semester %d</h2>", s->name, s->name, s->id, cur);
-            strcat(buf, "<form method='post' action='/enter-marks'>");
-            char hid[64]; snprintf(hid, sizeof(hid), "<input type='hidden' name='id' value='%d'/>", s->id); strcat(buf, hid);
-            strcat(buf, "<table border='1' cellpadding='6'><tr><th>#</th><th>Subject</th><th>Credits</th><th>Marks (0-100)</th></tr>");
-            int shown = 0;
-            for (int i=0;i<s->num_subjects;++i) {
-                int sem = subject_semester(s->subjects[i].name);
-                if (sem != cur) continue;
-                shown++;
-                char subj_esc[256]; html_escape_buf(s->subjects[i].name, subj_esc, sizeof(subj_esc));
-                char row[512];
-                /* input name uses the subject array index so POST can map back */
-                snprintf(row, sizeof(row), "<tr><td>%d</td><td>%s</td><td>%d</td><td><input name='mark_%d' value='%d' size='4' /></td></tr>", shown, subj_esc, s->subjects[i].credits, i, s->subjects[i].marks);
-                if (strlen(buf)+strlen(row)+256 > cap) { cap*=2; buf=realloc(buf,cap); }
-                strcat(buf, row);
-            }
-            if (shown == 0) {
-                strcat(buf, "<tr><td colspan='4'>No subjects for current semester.</td></tr>");
-            }
-            strcat(buf, "</table><div style='margin-top:8px'><button>Submit Marks</button></div></form><p><a href='/'>Back</a></p></body></html>");
-            send_text(client, "200 OK", "text/html; charset=utf-8", buf);
-            free(buf);
-            close(client); return;
-        }
-    } /* end GET */
+    /* Populate sensible default marks/attendance if none present (and student has subjects) */
+    populate_random_results(s);
 
-    /* POST handlers */
-    if (strcmp(method, "POST") == 0) {
-        char *body = strstr(req, "\r\n\r\n");
-        if (!body) { send_text(client, "400 Bad Request", "text/plain", "No body"); close(client); return; }
-        body += 4;
+    students[idx] = *s;
+    save_data();
+    printf("Student added successfully. ID: %d\n", s->id);
+}
 
-        /* Admin login */
-        if (strncmp(path, "/admin-login", strlen("/admin-login")) == 0) {
-            char *user = form_value(body, "username");
-            char *pass = form_value(body, "password");
-            if (!user || !pass) {
-                send_text(client, "400 Bad Request", "text/plain", "Missing username or password");
-                if (user) free(user); if (pass) free(pass);
-                close(client); return;
-            }
-            int ok = api_admin_auth(user, pass); /* uses student_system.c auth */
-            free(user); free(pass);
-            if (!ok) { send_text(client, "401 Unauthorized", "text/plain", "Invalid admin credentials"); close(client); return; }
-            /* admin dashboard: updated flows for attendance and marks */
-            const char *adm =
-              "<!doctype html><html><head><meta charset='utf-8'><title>Admin Dashboard</title>"
-              "<style>body{font-family:Arial;margin:18px} .card{max-width:900px;padding:18px;border-radius:10px;background:#fff;border:1px solid #eee} input,button,textarea,select{padding:8px;margin:6px 0;width:100%} button{background:#0b69ff;color:#fff;border:none;border-radius:6px}</style></head><body>"
-              "<div class='card'><h2>Admin Dashboard</h2>"
-              "<p>Manage marks and attendance.</p>"
-              "<h3>View all students</h3><p><a href='/list'>Open students list</a></p>"
-              "<h3>Enter marks for a student</h3>"
-              "<p>Step 1: Enter Student ID and click <em>Load Subjects</em>. The student's current semester subjects will be shown.</p>"
-              "<form method='get' action='/enter-marks' style='max-width:420px'>"
-              "<input name='id' placeholder='Student ID' required />"
-              "<div style='margin-top:8px'><button>Load Subjects</button></div></form>"
-              "<h3>Mark attendance</h3>"
-              "<p>Step 1: Select semester. Step 2: Select subject. Step 3: Mark attendance for students (only students in that semester will appear).</p>"
-              "<form method='get' action='/attendance' style='max-width:420px'><select name='semester'>"
-              "<option value='1'>Semester 1</option><option value='2'>Semester 2</option><option value='3'>Semester 3</option><option value='4'>Semester 4</option>"
-              "<option value='5'>Semester 5</option><option value='6'>Semester 6</option><option value='7'>Semester 7</option><option value='8'>Semester 8</option>"
-              "</select><div style='margin-top:8px'><button>Select Semester</button></div></form>"
-              "<p><a href='/'>Back</a></p></div></body></html>";
-            send_text(client, "200 OK", "text/html; charset=utf-8", adm);
-            close(client); return;
-        }
+/* interactive add student (admin) - now asks email, phone, semester */
+void add_student(void) {
+    Student s;
+    memset(&s, 0, sizeof(s));
+    s.exists = 1; s.cgpa = 0.0; s.total_credits_completed = 0;
 
-        /* Student sign-up */
-        if (strncmp(path, "/student-signup", strlen("/student-signup")) == 0) {
-            char *name = form_value(body, "name");
-            char *age = form_value(body, "age");
-            char *sap = form_value(body, "sap_id");
-            char *password = form_value(body, "password");
-            char *email = form_value(body, "email");
-            char *phone = form_value(body, "phone");
-            char *semester = form_value(body, "semester");
-            if (!name || !age || !sap || !password || !email || !phone || !semester) {
-                send_text(client, "400 Bad Request", "text/plain", "Missing fields");
-                goto signup_cleanup;
-            }
-            int sapid = atoi(sap);
-            int sem = atoi(semester);
-            if (sapid <= 0 || sem < 1 || sem > 8) {
-                char resp[256];
-                snprintf(resp, sizeof(resp),
-                    "<!doctype html><html><body><p>Invalid SAP ID or semester provided.</p><p><a href='/'>Back</a></p></body></html>");
-                send_text(client, "400 Bad Request", "text/html; charset=utf-8", resp);
-                goto signup_cleanup;
-            }
-            Student s; memset(&s, 0, sizeof(s));
-            s.exists = 1; s.cgpa = 0.0; s.total_credits_completed = 0;
-            s.id = sapid;
-            strncpy(s.name, name, sizeof(s.name)-1); s.name[sizeof(s.name)-1]=0;
-            s.age = atoi(age);
-            strncpy(s.email, email, sizeof(s.email)-1); s.email[sizeof(s.email)-1]=0;
-            strncpy(s.phone, phone, sizeof(s.phone)-1); s.phone[sizeof(s.phone)-1]=0;
-            strncpy(s.dept, "B.Tech CSE", sizeof(s.dept)-1); s.dept[sizeof(s.dept)-1]=0;
-            s.year = 1;
-            s.current_semester = sem;
-            s.num_subjects = 0;
-            strncpy(s.password, password, sizeof(s.password)-1); s.password[sizeof(s.password)-1]=0;
+    printf("Enter student ID (integer) or 0 to auto-generate: ");
+    while (scanf("%d", &s.id) != 1) { clear_stdin(); printf("Invalid. Enter student ID (integer) or 0 to auto-generate: "); }
+    clear_stdin();
+    if (s.id == 0) s.id = generate_unique_id();
+    else if (find_index_by_id(s.id) != -1) { printf("Student with ID %d already exists.\n", s.id); return; }
 
-            /* Default semester subjects arrays */
-            const char *sem1[] = {
-                "Programming in C","Linux Lab","Problem Solving","Advanced Engineering Mathematics - I","Physics for Computer Engineers","Managing Self","Environmental Sustainability and Climate Change", NULL
-            };
-            const int sem1_c[] = {5,2,2,4,5,2,2};
-            const char *sem2[] = {
-                "Data Structures and Algorithms","Digital Electronics","Python Programming","Advanced Engineering Mathematics - II","Environmental Sustainability and Climate Change","Time and Priority Management","Elements of AI/ML", NULL
-            };
-            const int sem2_c[] = {5,3,5,4,2,2,3};
-            const char *sem3[] = {
-                "Leading Conversations","Discrete Mathematical Structures","Operating Systems","Elements of AI/ML","Database Management Systems","Design and Analysis of Algorithms", NULL
-            };
-            const int sem3_c[] = {2,3,3,3,5,4};
-            const char *sem4[] = {
-                "Software Engineering","EDGE - Soft Skills","Linear Algebra","Indian Constitution","Writing with Impact","Object Oriented Programming","Data Communication and Networks","Applied Machine Learning", NULL
-            };
-            const int sem4_c[] = {3,0,3,0,2,4,4,5};
-            const char *sem5[] = {
-                "Cryptography and Network Security","Formal Languages and Automata Theory","Object Oriented Analysis and Design","Exploratory-3","Start your Startup","Research Methodology in CS","Probability, Entropy, and MC Simulation","PE-2","PE-2 Lab", NULL
-            };
-            const int sem5_c[] = {3,3,3,3,2,3,3,4,1};
-            const char *sem6[] = {
-                "Exploratory-4","Leadership and Teamwork","Compiler Design","Statistics and Data Analysis","PE-3","PE-3 Lab","Minor Project", NULL
-            };
-            const int sem6_c[] = {3,2,3,3,4,1,5};
-            const char *sem7[] = {
-                "Exploratory-5","PE-4","PE-4 Lab","PE-5","PE-5 Lab","Capstone Project - Phase-1","Summer Internship", NULL
-            };
-            const int sem7_c[] = {3,4,1,3,1,5,1};
-            const char *sem8[] = {
-                "IT Ethical Practices","Capstone Project - Phase-2", NULL
-            };
-            const int sem8_c[] = {3,5};
+    printf("Enter full name: ");
+    fgets(s.name, sizeof(s.name), stdin); s.name[strcspn(s.name, "\n")] = 0;
 
-            for (int cur=1; cur<=sem; ++cur) {
-                if (cur==1) add_subjects_to_student(&s, sem1, sem1_c);
-                else if (cur==2) add_subjects_to_student(&s, sem2, sem2_c);
-                else if (cur==3) add_subjects_to_student(&s, sem3, sem3_c);
-                else if (cur==4) add_subjects_to_student(&s, sem4, sem4_c);
-                else if (cur==5) add_subjects_to_student(&s, sem5, sem5_c);
-                else if (cur==6) add_subjects_to_student(&s, sem6, sem6_c);
-                else if (cur==7) add_subjects_to_student(&s, sem7, sem7_c);
-                else if (cur==8) add_subjects_to_student(&s, sem8, sem8_c);
-            }
+    printf("Enter age: ");
+    while (scanf("%d", &s.age) != 1) { clear_stdin(); printf("Invalid. Enter age: "); }
+    clear_stdin();
 
-            /* Save via API */
-            int addres = api_add_student(&s);
-            if (addres == -2) {
-                char resp[256];
-                snprintf(resp, sizeof(resp),
-                    "<!doctype html><html><body><p>SAP ID %d already registered. Try signing in.</p><p><a href='/'>Back</a></p></body></html>",
-                    s.id);
-                send_text(client, "409 Conflict", "text/html; charset=utf-8", resp);
-            } else if (addres <= 0) {
-                send_text(client, "500 Internal Server Error", "text/plain", "Unable to register");
-            } else {
-                char resp[512];
-                snprintf(resp, sizeof(resp),
-                    "<!doctype html><html><body><p>Registration successful!</p>"
-                    "<p>Your Student ID (SAP ID): <strong>%d</strong></p>"
-                    "<p>Default subjects for semester %d and earlier have been added automatically.</p>"
-                    "<p><a href='/'>Back to Home</a></p></body></html>", addres, sem);
-                send_text(client, "200 OK", "text/html; charset=utf-8", resp);
-            }
+    printf("Enter email: "); fgets(s.email, sizeof(s.email), stdin); s.email[strcspn(s.email, "\n")] = 0;
+    printf("Enter phone: "); fgets(s.phone, sizeof(s.phone), stdin); s.phone[strcspn(s.phone, "\n")] = 0;
 
-        signup_cleanup:
-            if (name) free(name);
-            if (age) free(age);
-            if (sap) free(sap);
-            if (password) free(password);
-            if (email) free(email);
-            if (phone) free(phone);
-            if (semester) free(semester);
-            close(client); return;
-        }
+    printf("Enter department: "); fgets(s.dept, sizeof(s.dept), stdin); s.dept[strcspn(s.dept, "\n")] = 0;
+    printf("Enter year (e.g., 1,2,3,4): ");
+    while (scanf("%d", &s.year) != 1) { clear_stdin(); printf("Invalid. Enter year: "); }
+    clear_stdin();
 
-        /* Enter marks (admin) - supports table-based (mark_<index>) and legacy textarea */
-        if (strncmp(path, "/enter-marks", strlen("/enter-marks")) == 0) {
-            /* Try to get student id first (hidden field) */
-            char *id_s = form_value(body, "id");
-            char *marks_txt = form_value(body, "marks"); /* legacy textarea */
-            if (!id_s && !marks_txt) {
-                send_text(client, "400 Bad Request", "text/plain", "Missing id/marks");
-                if (id_s) free(id_s);
-                if (marks_txt) free(marks_txt);
-                close(client); return;
-            }
+    printf("Enter current semester (1..8): ");
+    while (scanf("%d", &s.current_semester) != 1 || s.current_semester < 1 || s.current_semester > 8) {
+        clear_stdin(); printf("Invalid. Enter semester (1..8): ");
+    }
+    clear_stdin();
 
-            /* If id provided, prefer table-format parsing (mark_<index>=val) */
-            if (id_s) {
-                int sid = atoi(id_s);
-                free(id_s);
-                if (sid <= 0) {
-                    send_text(client, "400 Bad Request", "text/plain", "Invalid student id");
-                    if (marks_txt) free(marks_txt);
-                    close(client); return;
-                }
-                int idx = api_find_index_by_id(sid);
-                if (idx == -1) {
-                    send_text(client, "404 Not Found", "text/plain", "Student not found");
-                    if (marks_txt) free(marks_txt);
-                    close(client); return;
-                }
-                int any_found = 0;
-                /* scan for occurrences of "mark_" in the raw body and extract index and value */
-                const char *p = body;
-                while ((p = strstr(p, "mark_")) != NULL) {
-                    p += strlen("mark_");
-                    int idnum = atoi(p);
-                    /* find '=' following the number */
-                    const char *eq = strchr(p, '=');
-                    if (!eq) break;
-                    eq++;
-                    char valbuf[64]; int vi=0;
-                    while (*eq && *eq != '&' && vi < (int)sizeof(valbuf)-1) { valbuf[vi++]=*eq++; }
-                    valbuf[vi]=0;
-                    char *dec = strdup(valbuf); urldecode_inplace(dec);
-                    int mk = atoi(dec);
-                    free(dec);
-                    if (idnum >= 0 && idnum < students[idx].num_subjects) {
-                        students[idx].subjects[idnum].marks = mk;
-                        any_found = 1;
-                    }
-                }
-                /* fallback: if no mark_* fields but a legacy textarea exists, parse it */
-                if (!any_found && marks_txt) {
-                    char *line = strtok(marks_txt, "\n");
-                    int updated = 0;
-                    while (line) {
-                        while (*line == ' ' || *line == '\r' || *line == '\t') line++;
-                        char *sep = strstr(line, "|");
-                        if (sep) {
-                            *sep = 0;
-                            char *subj = line;
-                            char *mstr = sep + 1;
-                            while (*mstr==' ') mstr++;
-                            int mk = atoi(mstr);
-                            if (mk < 0) mk = 0;
-                            /* find subject by exact name and set marks */
-                            for (int i=0;i<students[idx].num_subjects;++i) {
-                                if (strcmp(students[idx].subjects[i].name, subj)==0) {
-                                    students[idx].subjects[i].marks = mk;
-                                    updated++;
-                                    break;
-                                }
-                            }
-                        }
-                        line = strtok(NULL, "\n");
-                    }
-                    any_found = (updated > 0);
-                }
-                if (!any_found) {
-                    send_text(client, "400 Bad Request", "text/plain", "No marks found in submission");
-                    if (marks_txt) free(marks_txt);
-                    close(client); return;
-                }
-                /* Recalculate CGPA via API and save */
-                api_calculate_update_cgpa(idx);
-                save_data();
-                char resp[256];
-                snprintf(resp, sizeof(resp), "<p>Marks updated for ID %d. <a href='/'>Back</a></p>", sid);
-                send_text(client, "200 OK", "text/html; charset=utf-8", resp);
-                if (marks_txt) free(marks_txt);
-                close(client); return;
-            }
+    if (find_duplicate_by_details(s.name, s.dept, s.year) != -1) { printf("Duplicate found. Registration cancelled.\n"); return; }
 
-            /* If we reach here and only marks_txt exists (rare), process legacy textarea */
-            if (marks_txt) {
-                /* try to find an id inside marks_txt? The legacy branch earlier required id as separate field.
-                   Here we can't proceed without an id, so return error. */
-                send_text(client, "400 Bad Request", "text/plain", "Missing student id for legacy marks format");
-                free(marks_txt);
-                close(client); return;
-            }
-        }
+    s.num_subjects = 0;
+    add_semesters_to_student(&s, s.current_semester);
 
-        /* Attendance POST (admin) - honors 'semester' hidden field and updates only students in that semester */
-        if (strncmp(path, "/attendance", strlen("/attendance")) == 0) {
-            char *subject = form_value(body, "subject");
-            char *date = form_value(body, "date"); /* date string */
-            char *semester_s = form_value(body, "semester");
-            if (!subject) { send_text(client, "400 Bad Request", "text/plain", "Missing subject"); if (date) free(date); if (semester_s) free(semester_s); close(client); return; }
-            int sem = 0;
-            if (semester_s) { sem = atoi(semester_s); free(semester_s); }
-            /* Collect present IDs */
-            int present_ids[2048]; int present_count=0;
-            const char *p = body;
-            while ((p = strstr(p, "present=")) != NULL) {
-                p += strlen("present=");
-                int val = atoi(p);
-                if (val > 0) { present_ids[present_count++] = val; }
-                const char *amp = strchr(p, '&');
-                if (!amp) break;
-                p = amp + 1;
-            }
-            /* mark attendance: for every student who has this subject AND whose current_semester == sem (if sem>0) increment held; if in present_ids increment attended */
-            int changed = 0;
-            for (int i=0;i<student_count;++i) {
-                if (!students[i].exists) continue;
-                if (sem > 0 && students[i].current_semester != sem) continue; /* only that semester */
-                for (int j=0;j<students[i].num_subjects;++j) {
-                    if (strcmp(students[i].subjects[j].name, subject)==0) {
-                        students[i].subjects[j].classes_held += 1;
-                        int was_present = 0;
-                        for (int k=0;k<present_count;++k) if (present_ids[k] == students[i].id) { was_present = 1; break; }
-                        if (was_present) students[i].subjects[j].classes_attended += 1;
-                        changed++;
+    printf("Set password for this student (no spaces): ");
+    fgets(s.password, sizeof(s.password), stdin); s.password[strcspn(s.password, "\n")] = 0;
+
+    add_student_custom(&s);
+}
+
+/* student self-register (CLI) - simplified: asks id or choose auto, name, age, email, phone, semester */
+void student_self_register(void) {
+    Student s;
+    memset(&s, 0, sizeof(s));
+    s.exists = 1; s.cgpa = 0.0; s.total_credits_completed = 0;
+
+    printf("Student Self-Registration\nEnter student ID (integer) or 0 to auto-generate: ");
+    while (scanf("%d", &s.id) != 1) { clear_stdin(); printf("Invalid. Enter student ID (integer) or 0 to auto-generate: "); }
+    clear_stdin();
+    if (s.id == 0) s.id = generate_unique_id();
+    else if (find_index_by_id(s.id) != -1) { printf("ID exists. Use login instead.\n"); return; }
+
+    printf("Enter full name: "); fgets(s.name, sizeof(s.name), stdin); s.name[strcspn(s.name, "\n")] = 0;
+    printf("Enter age: "); while (scanf("%d", &s.age) != 1) { clear_stdin(); printf("Invalid. Enter age: "); } clear_stdin();
+
+    printf("Enter email: "); fgets(s.email, sizeof(s.email), stdin); s.email[strcspn(s.email, "\n")] = 0;
+    printf("Enter phone: "); fgets(s.phone, sizeof(s.phone), stdin); s.phone[strcspn(s.phone, "\n")] = 0;
+
+    printf("Enter department: "); fgets(s.dept, sizeof(s.dept), stdin); s.dept[strcspn(s.dept, "\n")] = 0;
+    printf("Enter year (e.g., 1,2,3,4): "); while (scanf("%d", &s.year) != 1) { clear_stdin(); printf("Invalid. Enter year: "); } clear_stdin();
+
+    printf("Enter current semester (1..8): ");
+    while (scanf("%d", &s.current_semester) != 1 || s.current_semester < 1 || s.current_semester > 8) {
+        clear_stdin(); printf("Invalid. Enter semester (1..8): ");
+    }
+    clear_stdin();
+
+    if (find_duplicate_by_details(s.name, s.dept, s.year) != -1) { printf("Duplicate. Registration cancelled.\n"); return; }
+
+    s.num_subjects = 0;
+    add_semesters_to_student(&s, s.current_semester);
+
+    printf("Set password for this student (no spaces): ");
+    fgets(s.password, sizeof(s.password), stdin); s.password[strcspn(s.password, "\n")] = 0;
+    add_student_custom(&s);
+    printf("Registration complete. Use your ID and password to login.\n");
+}
+
+void edit_student(void) {
+    int id;
+    printf("Enter student ID to edit: ");
+    while (scanf("%d", &id) != 1) { clear_stdin(); printf("Invalid. Enter student ID: "); }
+    clear_stdin();
+    int idx = find_index_by_id(id);
+    if (idx == -1) { printf("Student not found.\n"); return; }
+    Student *s = &students[idx];
+    print_student_full(s);
+    printf("What to edit?\n1) Name\n2) Age\n3) Email\n4) Phone\n5) Dept\n6) Year\n7) Semester (rebuild subjects)\n8) Subjects (rename)\n9) Password\n10) Cancel\nChoose: ");
+    int ch;
+    while (scanf("%d", &ch) != 1) { clear_stdin(); printf("Invalid. Choose: "); }
+    clear_stdin();
+    switch (ch) {
+        case 1: printf("New name: "); fgets(s->name, sizeof(s->name), stdin); s->name[strcspn(s->name, "\n")] = 0; break;
+        case 2: printf("New age: "); while (scanf("%d", &s->age) != 1) { clear_stdin(); printf("Invalid. Enter age: "); } clear_stdin(); break;
+        case 3: printf("New email: "); fgets(s->email, sizeof(s->email), stdin); s->email[strcspn(s->email, "\n")] = 0; break;
+        case 4: printf("New phone: "); fgets(s->phone, sizeof(s->phone), stdin); s->phone[strcspn(s->phone, "\n")] = 0; break;
+        case 5: printf("New dept: "); fgets(s->dept, sizeof(s->dept), stdin); s->dept[strcspn(s->dept, "\n")] = 0; break;
+        case 6: printf("New year: "); while (scanf("%d", &s->year) != 1) { clear_stdin(); printf("Invalid. Enter year: "); } clear_stdin(); break;
+        case 7: {
+            printf("Enter new current semester (1..8): ");
+            int sem; while (scanf("%d", &sem) != 1 || sem < 1 || sem > 8) { clear_stdin(); printf("Invalid. Enter semester (1..8): "); }
+            clear_stdin();
+            s->current_semester = sem;
+            /* rebuild subject list from semesters 1..sem (preserve marks/attendance if names match) */
+            Subject backup[MAX_SUBJECTS];
+            int bk = s->num_subjects;
+            for (int i = 0; i < bk; ++i) backup[i] = s->subjects[i];
+            /* reset */
+            for (int i = 0; i < MAX_SUBJECTS; ++i) { s->subjects[i].name[0] = '\0'; s->subjects[i].credits = s->subjects[i].marks = s->subjects[i].classes_attended = s->subjects[i].classes_held = 0; }
+            s->num_subjects = 0;
+            add_semesters_to_student(s, sem);
+            /* try to restore marks/attendance where subject names match */
+            for (int i = 0; i < s->num_subjects; ++i) {
+                for (int j = 0; j < bk; ++j) {
+                    if (strcmp(s->subjects[i].name, backup[j].name) == 0) {
+                        s->subjects[i].marks = backup[j].marks;
+                        s->subjects[i].credits = backup[j].credits;
+                        s->subjects[i].classes_attended = backup[j].classes_attended;
+                        s->subjects[i].classes_held = backup[j].classes_held;
                         break;
                     }
                 }
             }
-            save_data();
-            /* write an attendance report file with date/time */
-            ensure_reports_dir();
-            time_t t = time(NULL); struct tm tm = *localtime(&t);
-            char datebuf[64];
-            snprintf(datebuf, sizeof(datebuf), "%04d-%02d-%02d", tm.tm_year+1900, tm.tm_mon+1, tm.tm_mday);
-            char subjslug[256]; slugify(subject, subjslug, sizeof(subjslug));
-            char fname[512]; snprintf(fname, sizeof(fname), "attendance_%s_%s.html", date ? date : datebuf, subjslug);
-            char fpath[PATH_MAX]; snprintf(fpath, sizeof(fpath), "reports/%s", fname);
-            FILE *f = fopen(fpath, "w");
-            if (f) {
-                fprintf(f, "<!doctype html><html><head><meta charset='utf-8'><title>Attendance %s</title></head><body>", subject);
-                fprintf(f, "<h2>Attendance for %s on %s</h2><table border='1' cellpadding='6'><tr><th>ID</th><th>Name</th><th>Present</th></tr>", subject, date ? date : datebuf);
-                for (int i=0;i<student_count;++i) {
-                    if (!students[i].exists) continue;
-                    if (sem > 0 && students[i].current_semester != sem) continue;
-                    int has = 0, is_present = 0;
-                    for (int j=0;j<students[i].num_subjects;++j) if (strcmp(students[i].subjects[j].name, subject)==0) { has=1; break; }
-                    if (!has) continue;
-                    for (int k=0;k<present_count;++k) if (present_ids[k] == students[i].id) { is_present = 1; break; }
-                    fprintf(f, "<tr><td>%d</td><td>%s</td><td>%s</td></tr>", students[i].id, students[i].name, is_present ? "Yes" : "No");
-                }
-                fprintf(f, "</table><p><a href='/'>Back</a></p></body></html>");
-                fclose(f);
-            }
-            char resp[512];
-            snprintf(resp, sizeof(resp), "<p>Attendance marked for subject '%s' (processed %d students). Report: <a href='/reports/%s' target='_blank'>%s</a>. <a href='/'>Back</a></p>", subject, changed, fname, fname);
-            send_text(client, "200 OK", "text/html; charset=utf-8", resp);
-            if (subject) free(subject);
-            if (date) free(date);
-            close(client); return;
+            break;
         }
-
-        /* unknown POST */
-        send_text(client, "404 Not Found", "text/plain", "Not found");
-        close(client); return;
+        case 8: {
+            printf("Subjects:\n"); for (int i = 0; i < s->num_subjects; ++i) printf("%d) %s\n", i+1, s->subjects[i].name);
+            printf("Enter subject number to rename: ");
+            int sn; while (scanf("%d", &sn) != 1 || sn < 1 || sn > s->num_subjects) { clear_stdin(); printf("Invalid. Enter subject number: "); }
+            clear_stdin(); printf("New subject name: "); fgets(s->subjects[sn-1].name, sizeof(s->subjects[sn-1].name), stdin); s->subjects[sn-1].name[strcspn(s->subjects[sn-1].name, "\n")] = 0;
+            break;
+        }
+        case 9: printf("New password: "); fgets(s->password, sizeof(s->password), stdin); s->password[strcspn(s->password, "\n")] = 0; break;
+        case 10: printf("Edit cancelled.\n"); return;
+        default: printf("Invalid option.\n"); return;
     }
-
-    /* fallback for other methods */
-    send_text(client, "405 Method Not Allowed", "text/plain", "Method not allowed");
-    close(client);
+    save_data(); printf("Student updated.\n");
 }
 
-/* main: single-threaded iterative server */
-int main(int argc, char **argv) {
-    const char *portenv = getenv("PORT");
-    int port = portenv ? atoi(portenv) : 8080;
-    int server_fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (server_fd < 0) { perror("socket"); return 1; }
-    int opt = 1; setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
-    struct sockaddr_in addr; memset(&addr, 0, sizeof(addr));
-    addr.sin_family = AF_INET; addr.sin_addr.s_addr = INADDR_ANY; addr.sin_port = htons(port);
-    if (bind(server_fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) { perror("bind"); close(server_fd); return 1; }
-    if (listen(server_fd, 10) < 0) { perror("listen"); close(server_fd); return 1; }
+void delete_student(void) {
+    int id; printf("Enter student ID to delete: ");
+    while (scanf("%d", &id) != 1) { clear_stdin(); printf("Invalid. Enter student ID: "); }
+    clear_stdin();
+    int idx = find_index_by_id(id);
+    if (idx == -1) { printf("Student not found.\n"); return; }
+    print_student_short(&students[idx]);
+    printf("Confirm delete (y/n): ");
+    char c = getchar(); clear_stdin();
+    if (c == 'y' || c == 'Y') { students[idx].exists = 0; save_data(); printf("Deleted.\n"); }
+    else printf("Cancelled.\n");
+}
 
-    ensure_reports_dir();
-    fprintf(stderr, "Student system web server listening on port %d\n", port);
-    fflush(stderr);
+void search_student(void) {
+    printf("Search by:\n1) ID\n2) Name substring\nChoose: ");
+    int ch; while (scanf("%d", &ch) != 1) { clear_stdin(); printf("Invalid. Choose: "); }
+    clear_stdin();
+    if (ch == 1) {
+        int id; printf("Enter ID: "); while (scanf("%d", &id) != 1) { clear_stdin(); printf("Invalid. Enter ID: "); } clear_stdin();
+        int idx = find_index_by_id(id); if (idx == -1) printf("Not found.\n"); else print_student_full(&students[idx]);
+    } else if (ch == 2) {
+        char q[128]; printf("Enter substring: "); fgets(q, sizeof(q), stdin); q[strcspn(q, "\n")] = 0;
+        char ql[128]; safe_strncpy(ql, q, sizeof(ql)); to_lower_str(ql);
+        int found = 0;
+        for (int i = 0; i < student_count; ++i) {
+            if (!students[i].exists) continue;
+            char lname[128]; safe_strncpy(lname, students[i].name, sizeof(lname)); to_lower_str(lname);
+            if (strstr(lname, ql)) { print_student_short(&students[i]); found = 1; }
+        }
+        if (!found) printf("No matches.\n");
+    } else printf("Invalid option.\n");
+}
 
-    while (1) {
-        struct sockaddr_in cli; socklen_t cli_len = sizeof(cli);
-        int client = accept(server_fd, (struct sockaddr*)&cli, &cli_len);
-        if (client < 0) { perror("accept"); continue; }
-        handle_client(client);
+/* Attendance functions (admin-run) - day-by-day attendance list & marking is simulated by per-class marking */
+void mark_attendance_for_class(void) {
+    printf("Enter exact subject name to mark (case-sensitive): ");
+    char sname[MAX_SUB_NAME]; fgets(sname, sizeof(sname), stdin); sname[strcspn(sname, "\n")] = 0;
+    int any = 0;
+    for (int i = 0; i < student_count; ++i) {
+        if (!students[i].exists) continue;
+        Student *st = &students[i];
+        for (int j = 0; j < st->num_subjects; ++j) {
+            if (strcmp(st->subjects[j].name, sname) == 0) {
+                any = 1;
+                printf("Student ID %d | %s : Present? (y/n) : ", st->id, st->name);
+                char c = getchar(); clear_stdin();
+                st->subjects[j].classes_held += 1;
+                if (c == 'y' || c == 'Y') st->subjects[j].classes_attended += 1;
+                break;
+            }
+        }
+    }
+    if (!any) printf("No students have subject '%s'.\n", sname);
+    else { save_data(); printf("Attendance recorded.\n"); }
+}
+
+/* Mark attendance with a list and tickboxes is a web UI feature; here we keep CLI single-student and per-class methods */
+void mark_attendance_single_student(void) {
+    int id; printf("Enter student ID: "); while (scanf("%d", &id) != 1) { clear_stdin(); printf("Invalid. Enter student ID: "); } clear_stdin();
+    int idx = find_index_by_id(id); if (idx == -1) { printf("Not found.\n"); return; }
+    Student *s = &students[idx];
+    for (int i = 0; i < s->num_subjects; ++i) printf("%d) %s (Attended %d / Held %d)\n", i+1, s->subjects[i].name, s->subjects[i].classes_attended, s->subjects[i].classes_held);
+    printf("Choose subject number: "); int sn; while (scanf("%d", &sn) != 1 || sn < 1 || sn > s->num_subjects) { clear_stdin(); printf("Invalid. Choose subject number: "); } clear_stdin();
+    int idxs = sn - 1; s->subjects[idxs].classes_held += 1;
+    printf("Present? (y/n): "); char c = getchar(); clear_stdin();
+    if (c == 'y' || c == 'Y') s->subjects[idxs].classes_attended += 1;
+    save_data(); printf("Attendance updated.\n");
+}
+
+void increment_classes_held_only(void) {
+    printf("Enter exact subject name to increment classes held: ");
+    char sname[MAX_SUB_NAME]; fgets(sname, sizeof(sname), stdin); sname[strcspn(sname, "\n")] = 0;
+    int any = 0;
+    for (int i = 0; i < student_count; ++i) {
+        if (!students[i].exists) continue;
+        Student *st = &students[i];
+        for (int j = 0; j < st->num_subjects; ++j) {
+            if (strcmp(st->subjects[j].name, sname) == 0) { st->subjects[j].classes_held += 1; any = 1; }
+        }
+    }
+    if (!any) printf("No students have subject '%s'.\n", sname);
+    else { save_data(); printf("Classes held incremented.\n"); }
+}
+
+void attendance_report_subject(void) {
+    printf("Enter exact subject name for report: ");
+    char sname[MAX_SUB_NAME]; fgets(sname, sizeof(sname), stdin); sname[strcspn(sname, "\n")] = 0;
+    int found = 0; printf("Attendance report for '%s'\nID | Name | Attended | Held | %%\n", sname);
+    for (int i = 0; i < student_count; ++i) {
+        if (!students[i].exists) continue;
+        Student *st = &students[i];
+        for (int j = 0; j < st->num_subjects; ++j) {
+            if (strcmp(st->subjects[j].name, sname) == 0) {
+                int att = st->subjects[j].classes_attended; int held = st->subjects[j].classes_held;
+                double pct = (held==0)?0.0:((double)att/held)*100.0;
+                printf("%d | %s | %d | %d | %.2f%%\n", st->id, st->name, att, held, pct); found = 1;
+            }
+        }
+    }
+    if (!found) printf("No records for '%s'.\n", sname);
+}
+
+/* Student view functions */
+void student_view_profile(int idx) {
+    if (idx < 0 || idx >= student_count) return;
+    print_student_full(&students[idx]);
+}
+
+void student_view_sgpa_and_cgpa(int idx) {
+    if (idx < 0 || idx >= student_count) return;
+    double sgpa = calculate_sgpa_for_student(&students[idx]);
+    printf("Student: %s (ID %d)\nSGPA (current semester): %.3f\nCGPA (stored): %.3f (Credits: %d)\n",
+           students[idx].name, students[idx].id, sgpa, students[idx].cgpa, students[idx].total_credits_completed);
+    char path[512]; snprintf(path, sizeof(path), "%s/%d_result.html", REPORTS_DIR, students[idx].id);
+    FILE *f = fopen(path, "r"); if (f) { fclose(f); printf("Printable result: %s\n", path); } else printf("No printable result yet.\n");
+}
+
+/* Interactive admin marks handler — does NOT auto-generate printable report per your request */
+void admin_enter_marks_and_update_cgpa(void) {
+    int id;
+    printf("Enter student ID to enter marks for: ");
+    while (scanf("%d", &id) != 1) { clear_stdin(); printf("Invalid. Enter student ID: "); }
+    clear_stdin();
+    int idx = find_index_by_id(id);
+    if (idx == -1) { printf("Student not found.\n"); return; }
+    Student *s = &students[idx];
+    if (s->num_subjects <= 0) { printf("Student has no subjects defined.\n"); return; }
+
+    printf("Entering marks for %s (ID: %d). Enter marks for each subject.\n", s->name, s->id);
+    for (int i = 0; i < s->num_subjects; ++i) {
+        int mk = -1;
+        printf("Subject %d) %s (credits %d)\n", i+1, s->subjects[i].name, s->subjects[i].credits);
+        printf("  Enter marks (0-100): ");
+        while (scanf("%d", &mk) != 1 || mk < 0 || mk > 100) { clear_stdin(); printf("Invalid. Enter marks (0-100): "); }
+        clear_stdin();
+        s->subjects[i].marks = mk;
     }
 
-    close(server_fd);
+    /* Recalculate CGPA and save */
+    calculate_and_update_cgpa_for_student(idx);
+    save_data();
+    printf("Marks entered and CGPA updated for ID %d.\n", id);
+}
+
+/* Menus & auth (admin menu updated: removed "generate report" option) */
+int admin_menu(void) {
+    while (1) {
+        printf("\n=== ADMIN MENU ===\n1) Add student\n2) Edit student\n3) Delete student\n4) List students\n5) Search student\n6) Mark attendance (class)\n7) Mark attendance (single student)\n8) Increment classes held only\n9) Attendance report (subject)\n10) Enter marks & update CGPA for a student\n11) Logout\nChoose: ");
+        int ch; while (scanf("%d", &ch) != 1) { clear_stdin(); printf("Invalid. Choose: "); } clear_stdin();
+        switch (ch) {
+            case 1: add_student(); break;
+            case 2: edit_student(); break;
+            case 3: delete_student(); break;
+            case 4: { printf("List of students:\n"); for (int i=0;i<student_count;i++) if (students[i].exists) print_student_short(&students[i]); break; }
+            case 5: search_student(); break;
+            case 6: mark_attendance_for_class(); break;
+            case 7: mark_attendance_single_student(); break;
+            case 8: increment_classes_held_only(); break;
+            case 9: attendance_report_subject(); break;
+            case 10: admin_enter_marks_and_update_cgpa(); break;
+            case 11: return 0;
+            default: printf("Invalid option.\n"); break;
+        }
+        pause_console();
+    }
     return 0;
+}
+
+int student_menu(int student_idx) {
+    if (student_idx < 0 || student_idx >= student_count) return -1;
+    while (1) {
+        printf("\n=== STUDENT MENU ===\n1) View profile & attendance\n2) View SGPA & CGPA\n3) Download/See printable report path\n4) Change password\n5) Logout\nChoose: ");
+        int ch; while (scanf("%d", &ch) != 1) { clear_stdin(); printf("Invalid. Choose: "); } clear_stdin();
+        Student *s = &students[student_idx];
+        switch (ch) {
+            case 1: student_view_profile(student_idx); break;
+            case 2: student_view_sgpa_and_cgpa(student_idx); break;
+            case 3: {
+                char path[512]; snprintf(path, sizeof(path), "%s/%d_result.html", REPORTS_DIR, s->id);
+                FILE *f = fopen(path, "r"); if (f) { fclose(f); printf("Printable result: %s\n", path); } else printf("No printable result.\n");
+                break;
+            }
+            case 4: {
+                char oldp[50], newp[50];
+                printf("Enter current password: "); fgets(oldp, sizeof(oldp), stdin); oldp[strcspn(oldp, "\n")] = 0;
+                if (strcmp(oldp, s->password) != 0) { printf("Wrong password.\n"); }
+                else { printf("Enter new password: "); fgets(newp, sizeof(newp), stdin); newp[strcspn(newp, "\n")] = 0; safe_strncpy(s->password, newp, sizeof(s->password)); save_data(); printf("Password changed.\n"); }
+                break;
+            }
+            case 5: return 0;
+            default: printf("Invalid option.\n"); break;
+        }
+        pause_console();
+    }
+    return 0;
+}
+
+void admin_login(void) {
+    char user[50], pass[50];
+    printf("Admin Username: "); fgets(user, sizeof(user), stdin); user[strcspn(user, "\n")] = 0;
+    printf("Admin Password: "); fgets(pass, sizeof(pass), stdin); pass[strcspn(pass, "\n")] = 0;
+    if (strcmp(user, ADMIN_USER) == 0 && strcmp(pass, ADMIN_PASS) == 0) { printf("Admin authenticated.\n"); admin_menu(); }
+    else printf("Invalid admin credentials.\n");
+}
+
+void student_login(void) {
+    int id; printf("Enter student ID: "); while (scanf("%d", &id) != 1) { clear_stdin(); printf("Invalid. Enter student ID: "); } clear_stdin();
+    int idx = find_index_by_id(id); if (idx == -1) { printf("Student ID not found.\n"); return; }
+    char pass[50]; printf("Enter password: "); fgets(pass, sizeof(pass), stdin); pass[strcspn(pass, "\n")] = 0;
+    if (strcmp(pass, students[idx].password) == 0) { printf("Welcome, %s!\n", students[idx].name); student_menu(idx); }
+    else printf("Wrong password.\n");
+}
+
+void main_menu(void) {
+    while (1) {
+        printf("\n=== STUDENT MANAGEMENT SYSTEM ===\n1) Admin login\n2) Student login\n3) Exit\n4) Student self-register\nChoose: ");
+        int ch; while (scanf("%d", &ch) != 1) { clear_stdin(); printf("Invalid. Choose: "); } clear_stdin();
+        switch (ch) {
+            case 1: admin_login(); break;
+            case 2: student_login(); break;
+            case 3: printf("Exiting... Goodbye.\n"); return;
+            case 4: student_self_register(); break;
+            default: printf("Invalid option.\n"); break;
+        }
+    }
+}
+
+/* ---------- Non-interactive CLI helpers (file formats) ---------- */
+
+/* add-file format (single line):
+   id|name|age|email|phone|dept|year|semester
+*/
+int cli_add_from_file(const char *path) {
+    FILE *f = fopen(path, "r");
+    if (!f) { fprintf(stderr, "Unable to open add-file: %s\n", path); return 1; }
+    char line[4096];
+    if (!fgets(line, sizeof(line), f)) { fclose(f); fprintf(stderr, "Empty add-file\n"); return 1; }
+    fclose(f);
+    line[strcspn(line, "\r\n")] = 0;
+    /* parse fields */
+    char *parts[10]; int pi = 0;
+    char *tok = strtok(line, "|");
+    while (tok && pi < 10) { parts[pi++] = tok; tok = strtok(NULL, "|"); }
+    if (pi < 8) { fprintf(stderr, "Invalid add-file format (need id|name|age|email|phone|dept|year|semester)\n"); return 1; }
+    Student s; memset(&s, 0, sizeof(s)); s.exists = 1; s.cgpa = 0.0; s.total_credits_completed = 0;
+    s.id = atoi(parts[0]);
+    safe_strncpy(s.name, parts[1], sizeof(s.name));
+    s.age = atoi(parts[2]);
+    safe_strncpy(s.email, parts[3], sizeof(s.email));
+    safe_strncpy(s.phone, parts[4], sizeof(s.phone));
+    safe_strncpy(s.dept, parts[5], sizeof(s.dept));
+    s.year = atoi(parts[6]);
+    s.current_semester = atoi(parts[7]);
+    if (s.current_semester < 1 || s.current_semester > 8) s.current_semester = 1;
+    s.num_subjects = 0;
+    add_semesters_to_student(&s, s.current_semester);
+    safe_strncpy(s.password, "changeme", sizeof(s.password));
+
+    /* populate defaults */
+    populate_random_results(&s);
+
+    if (s.id == 0) s.id = generate_unique_id();
+    add_student_custom(&s);
+    printf("Added student ID %d\n", s.id);
+    return 0;
+}
+
+/* marks file:
+   first line: id
+   subsequent lines: mark,subject-name (subject name must exactly match)
+*/
+int cli_enter_marks_file(const char *path) {
+    FILE *f = fopen(path, "r");
+    if (!f) { fprintf(stderr, "Unable to open marks file %s\n", path); return 1; }
+    char line[1024];
+    if (!fgets(line, sizeof(line), f)) { fclose(f); fprintf(stderr, "Invalid marks file\n"); return 1; }
+    int id = atoi(line); int idx = find_index_by_id(id);
+    if (idx == -1) { fclose(f); fprintf(stderr, "Student not found\n"); return 1; }
+    Student *s = &students[idx];
+    while (fgets(line, sizeof(line), f)) {
+        line[strcspn(line, "\r\n")] = 0;
+        int mk = 0; char subj[MAX_SUB_NAME];
+        if (sscanf(line, "%d|%99[^\n]", &mk, subj) == 2) {
+            /* find subject */
+            for (int i = 0; i < s->num_subjects; ++i) {
+                if (strcmp(s->subjects[i].name, subj) == 0) {
+                    s->subjects[i].marks = mk;
+                    break;
+                }
+            }
+        }
+    }
+    fclose(f);
+    calculate_and_update_cgpa_for_student(idx);
+    printf("Marks updated for ID %d\n", id);
+    return 0;
+}
+
+/* CLI view/list */
+int cli_list(void) {
+    for (int i = 0; i < student_count; ++i) {
+        if (!students[i].exists) continue;
+        printf("%d|%s|%d|%s|sem:%d\n", students[i].id, students[i].name, students[i].year, students[i].dept, students[i].current_semester);
+    }
+    return 0;
+}
+
+int cli_view(int id) {
+    int idx = find_index_by_id(id);
+    if (idx == -1) { fprintf(stderr, "Not found\n"); return 1; }
+    print_student_full(&students[idx]);
+    return 0;
+}
+
+/* generate-report arg format: "<id>|<college>|<semester>|<exam>" */
+int cli_generate_report_arg(const char *arg) {
+    if (!arg) { fprintf(stderr, "Missing arg\n"); return 1; }
+    char buf[1024]; safe_strncpy(buf, arg, sizeof(buf));
+    char *p = strtok(buf, "|"); if (!p) return 1;
+    int id = atoi(p);
+    char college[256] = "Your College", semester[128] = "Semester -", exam[128] = "Exam -";
+    if ((p = strtok(NULL, "|")) != NULL) safe_strncpy(college, p, sizeof(college));
+    if ((p = strtok(NULL, "|")) != NULL) safe_strncpy(semester, p, sizeof(semester));
+    if ((p = strtok(NULL, "|")) != NULL) safe_strncpy(exam, p, sizeof(exam));
+    int idx = find_index_by_id(id);
+    if (idx == -1) { fprintf(stderr, "Student not found\n"); return 1; }
+    generate_html_report(idx, college, semester, exam);
+    printf("Report written: %s/%d_result.html\n", REPORTS_DIR, id);
+    return 0;
+}
+
+/* ---------- API wrappers for web server linking ---------- */
+
+int api_find_index_by_id(int id) { return find_index_by_id(id); }
+int api_add_student(Student *s) {
+    if (!s) return -1;
+    /* if caller provided an explicit id, check duplicate */
+    if (s->id != 0) {
+        if (find_index_by_id(s->id) != -1) return -2;
+    }
+    if (s->id == 0) s->id = generate_unique_id();
+
+    /* populate defaults if needed */
+    populate_random_results(s);
+
+    add_student_custom(s);
+    return s->id;
+}
+void api_generate_report(int idx, const char* college, const char* semester, const char* exam) { generate_html_report(idx, college, semester, exam); }
+int api_calculate_update_cgpa(int idx) { calculate_and_update_cgpa_for_student(idx); return 0; }
+
+/* ---------- new: API admin auth (used by web wrapper) ---------- */
+int api_admin_auth(const char *user, const char *pass) {
+    if (!user || !pass) return 0;
+    if (strcmp(user, ADMIN_USER) == 0 && strcmp(pass, ADMIN_PASS) == 0) return 1;
+    return 0;
+}
+
+/* ---------- main (interactive) ---------- */
+
+#ifndef BUILD_WEB
+int main(int argc, char **argv) {
+    /* support demo and CLI modes when run directly (useful for testing) */
+    if (argc > 1) {
+        load_data();
+        if (strcmp(argv[1], "--demo") == 0) {
+            printf("Demo Mode: Student Management System\n");
+            /* Demo: create two sample students if none exist */
+            if (student_count == 0 || find_index_by_id(1001) == -1) {
+                Student s; memset(&s,0,sizeof(s)); s.exists=1; s.id=1001; safe_strncpy(s.name,"Tanay Sah",sizeof(s.name)); s.age=18; safe_strncpy(s.dept,"B.Tech CSE",sizeof(s.dept)); s.year=1; s.current_semester=1; s.num_subjects=0; add_semesters_to_student(&s,1); safe_strncpy(s.password,"pass",sizeof(s.password)); populate_random_results(&s); add_student_custom(&s);
+            }
+            if (find_index_by_id(1002) == -1) {
+                Student s; memset(&s,0,sizeof(s)); s.exists=1; s.id=1002; safe_strncpy(s.name,"Riya Sharma",sizeof(s.name)); s.age=18; safe_strncpy(s.dept,"B.Tech CSE",sizeof(s.dept)); s.year=1; s.current_semester=1; s.num_subjects=0; add_semesters_to_student(&s,1); safe_strncpy(s.password,"pass",sizeof(s.password)); populate_random_results(&s); add_student_custom(&s);
+            }
+            printf("Sample students created (1001,1002). Use interactive menu to explore.\n");
+            return 0;
+        } else if (strcmp(argv[1], "--list") == 0) {
+            load_data(); return cli_list();
+        } else if (strcmp(argv[1], "--view") == 0 && argc > 2) {
+            load_data(); return cli_view(atoi(argv[2]));
+        } else if (strcmp(argv[1], "--generate-report") == 0 && argc > 2) {
+            load_data(); return cli_generate_report_arg(argv[2]);
+        } else if (strcmp(argv[1], "--add-file") == 0 && argc > 2) {
+            load_data(); return cli_add_from_file(argv[2]);
+        } else if (strcmp(argv[1], "--enter-marks-file") == 0 && argc > 2) {
+            load_data(); return cli_enter_marks_file(argv[2]);
+        }
+    }
+
+    /* Don't launch interactive menu if no TTY (useful for hosting) */
+    if (!isatty(fileno(stdin))) {
+        fprintf(stderr, "Non-interactive environment detected. Use --demo for sample output.\n");
+        return 1;
+    }
+
+    MKDIR(REPORTS_DIR);
+    for (int i = 0; i < MAX_STUDENTS; ++i) students[i].exists = 0;
+    load_data();
+    printf("Welcome to Student Record & Attendance Management System\n(Note: Default admin -> username: %s | password: %s)\n", ADMIN_USER, ADMIN_PASS);
+    main_menu();
+    return 0;
+}
+#endif /* BUILD_WEB */
+
+/* ---------- Implementations of new helpers ---------- */
+
+/* Map subject name to semester index (1..8); returns 0 if unknown */
+static int subject_semester(const char *sname) {
+    if (!sname) return 0;
+    for (int sem = 1; sem <= 8; ++sem) {
+        const char **list = sem_subjects[sem];
+        if (!list) continue;
+        for (int j = 0; list[j] != NULL; ++j) {
+            if (strcmp(list[j], sname) == 0) return sem;
+        }
+    }
+    return 0;
+}
+
+/* populate_random_results:
+   - deterministic via seed based on student id (so repeated runs for same id yield same defaults)
+   - only fills marks/attendance if they are zero (so manual edits are preserved)
+*/
+static void populate_random_results(Student *s) {
+    if (!s) return;
+    /* seed using student's id for determinism */
+    unsigned int seed = (unsigned int)(s->id ? (unsigned)s->id ^ 0x9e3779b9u : (unsigned)time(NULL));
+    /* simple helper */
+    auto_rand:
+    ;
+    /* local lambda-like helpers using rand_r */
+    unsigned int rseed = seed;
+
+    int any_subject = 0;
+    for (int i = 0; i < s->num_subjects; ++i) {
+        any_subject = 1;
+        int sem = subject_semester(s->subjects[i].name);
+        /* default classes_held between 10 and 30 if zero */
+        if (s->subjects[i].classes_held == 0) {
+            int x = (int)(rand_r(&rseed) % 21) + 10; /* 10..30 */
+            s->subjects[i].classes_held = x;
+        }
+        /* if classes_attended == 0, make it between 60% and 95% of held (older sems higher), otherwise preserve */
+        if (s->subjects[i].classes_attended == 0) {
+            double minpct = 0.6, maxpct = 0.95;
+            if (sem > 0 && s->current_semester > 0 && sem < s->current_semester) {
+                /* older semesters: higher pass/attendance */
+                minpct = 0.75; maxpct = 0.98;
+            } else if (sem == s->current_semester) {
+                /* current semester: realistic but slightly lower */
+                minpct = 0.55; maxpct = 0.92;
+            }
+            int held = s->subjects[i].classes_held;
+            int pct = (int)(minpct*100) + (rand_r(&rseed) % (int)((maxpct-minpct)*100 + 1));
+            int attended = (int)((pct/100.0) * held + 0.5);
+            if (attended > held) attended = held;
+            s->subjects[i].classes_attended = attended;
+        }
+        /* marks: if zero, assign based on semester relation */
+        if (s->subjects[i].marks == 0) {
+            int mk;
+            if (sem > 0 && s->current_semester > 0 && sem < s->current_semester) {
+                /* past semesters: likely passed => marks 55..95 */
+                mk = 55 + (rand_r(&rseed) % 41); /* 55..95 */
+            } else if (sem == s->current_semester) {
+                /* current semester: slightly wider spread 40..92 */
+                mk = 45 + (rand_r(&rseed) % 48); /* 45..92 */
+            } else {
+                /* unknown grouping */
+                mk = 40 + (rand_r(&rseed) % 51); /* 40..90 */
+            }
+            if (mk < 0) mk = 0; if (mk > 100) mk = 100;
+            s->subjects[i].marks = mk;
+        }
+    }
+
+    /* compute CGPA now (a full recompute over all subjects) */
+    if (any_subject) {
+        /* compute totals */
+        int total_credits = 0;
+        double total_weighted = 0.0;
+        for (int i = 0; i < s->num_subjects; ++i) {
+            int cr = s->subjects[i].credits;
+            int mk = s->subjects[i].marks;
+            if (cr <= 0) continue;
+            int gp = marks_to_grade_point(mk);
+            total_weighted += (double)gp * cr;
+            total_credits += cr;
+        }
+        if (total_credits > 0) {
+            s->cgpa = total_weighted / (double)total_credits;
+            s->total_credits_completed = total_credits;
+        } else {
+            s->cgpa = 0.0;
+            s->total_credits_completed = 0;
+        }
+    }
+    /* update seed out-of-band: not necessary (deterministic by ID) */
+    return;
 }
