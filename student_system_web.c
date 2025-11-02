@@ -3,9 +3,15 @@
    - Landing: Admin login / Student signup / Student signin
    - Student signup includes email, phone, semester (auto-adds semester subjects)
    - Admin: enter marks by subject-name, mark attendance via checkboxes per subject & date
-   - Student dashboard: attendance chart, subjects, marks, SGPA, CGPA
+   - Student dashboard: attendance chart, subjects, SGPA, CGPA
    Compile with:
      gcc -DBUILD_WEB student_system.c student_system_web.c -o student_system_web
+
+   UPDATED: student dashboard now groups subjects by semester (1..N) and shows
+   semester-wise attendance distribution. For students beyond semester 1, if
+   subject marks and attendance are empty (zero), the dashboard displays
+   deterministic "default" random-looking marks and attendance computed from
+   student ID + subject name so you don't need to manually populate past data.
 */
 
 #define _GNU_SOURCE
@@ -198,6 +204,70 @@ static void add_subjects_to_student(Student *s, const char **list, const int *cr
     }
 }
 
+/* --- Semester arrays (duplicate of student_system.c lists to allow grouping in dashboard) --- */
+static const char *sem1[] = {
+    "Programming in C","Linux Lab","Problem Solving","Advanced Engineering Mathematics - I","Physics for Computer Engineers","Managing Self","Environmental Sustainability and Climate Change", NULL
+};
+static const int sem1_c[] = {5,2,2,4,5,2,2};
+static const char *sem2[] = {
+    "Data Structures and Algorithms","Digital Electronics","Python Programming","Advanced Engineering Mathematics - II","Environmental Sustainability and Climate Change","Time and Priority Management","Elements of AI/ML", NULL
+};
+static const int sem2_c[] = {5,3,5,4,2,2,3};
+static const char *sem3[] = {
+    "Leading Conversations","Discrete Mathematical Structures","Operating Systems","Elements of AI/ML","Database Management Systems","Design and Analysis of Algorithms", NULL
+};
+static const int sem3_c[] = {2,3,3,3,5,4};
+static const char *sem4[] = {
+    "Software Engineering","EDGE - Soft Skills","Linear Algebra","Indian Constitution","Writing with Impact","Object Oriented Programming","Data Communication and Networks","Applied Machine Learning", NULL
+};
+static const int sem4_c[] = {3,0,3,0,2,4,4,5};
+static const char *sem5[] = {
+    "Cryptography and Network Security","Formal Languages and Automata Theory","Object Oriented Analysis and Design","Exploratory-3","Start your Startup","Research Methodology in CS","Probability, Entropy, and MC Simulation","PE-2","PE-2 Lab", NULL
+};
+static const int sem5_c[] = {3,3,3,3,2,3,3,4,1};
+static const char *sem6[] = {
+    "Exploratory-4","Leadership and Teamwork","Compiler Design","Statistics and Data Analysis","PE-3","PE-3 Lab","Minor Project", NULL
+};
+static const int sem6_c[] = {3,2,3,3,4,1,5};
+static const char *sem7[] = {
+    "Exploratory-5","PE-4","PE-4 Lab","PE-5","PE-5 Lab","Capstone Project - Phase-1","Summer Internship", NULL
+};
+static const int sem7_c[] = {3,4,1,3,1,5,1};
+static const char *sem8[] = {
+    "IT Ethical Practices","Capstone Project - Phase-2", NULL
+};
+static const int sem8_c[] = {3,5};
+
+/* helper: deterministic hash to produce repeatable 'random' values per student+subject */
+static unsigned int deterministic_hash(const char *s, unsigned int seed) {
+    unsigned int h = seed ^ 2166136261u;
+    while (*s) {
+        h ^= (unsigned char)(*s++);
+        h *= 16777619u;
+    }
+    /* further scramble */
+    h ^= (h >> 16);
+    h *= 0x85ebca6b;
+    h ^= (h >> 13);
+    h *= 0xc2b2ae35;
+    h ^= (h >> 16);
+    return h;
+}
+
+/* determine semester index for a subject name by searching the semester arrays above
+   returns 1..8 if found, 0 if unknown */
+static int subject_semester(const char *sname) {
+    const char **lists[] = { NULL, sem1, sem2, sem3, sem4, sem5, sem6, sem7, sem8 };
+    for (int sem=1; sem<=8; ++sem) {
+        const char **lst = lists[sem];
+        if (!lst) continue;
+        for (int j=0; lst[j]!=NULL; ++j) {
+            if (strcmp(lst[j], sname) == 0) return sem;
+        }
+    }
+    return 0;
+}
+
 /* Build landing page (signup includes extra fields) */
 static char *build_landing_page(void) {
     ensure_reports_dir();
@@ -365,49 +435,104 @@ static char *build_list_html(void) {
     return buf;
 }
 
-/* build student dashboard as HTML with attendance & marks */
+/* build student dashboard as HTML with attendance & marks (UPDATED)
+   - groups subjects by semester
+   - displays deterministic default marks/attendance for earlier semesters when data is empty
+   - shows semester-wise attendance distribution (bar chart)
+*/
 static char *build_student_dashboard(int idx) {
     if (idx < 0 || idx >= student_count) return NULL;
     Student *s = &students[idx];
     char escaped_name[256]; html_escape_buf(s->name, escaped_name, sizeof(escaped_name));
-    char subject_rows[8192]; subject_rows[0]=0;
-    int maxbars = s->num_subjects;
-    int percentages[MAX_SUBJECTS];
+
+    /* Prepare semester buckets 1..8 */
+    char sem_tables[9][8192];
+    int sem_caps[9];
+    for (int i=0;i<9;++i) { sem_tables[i][0]=0; sem_caps[i]=8192; }
+
+    /* We will also compute semester-wise average attendance */
+    int sem_subject_counts[9] = {0};
+    int sem_attended_sum[9] = {0};
+    int sem_held_sum[9] = {0};
+
+    /* helper local buffers */
+    char sname_esc[256];
+
     for (int i = 0; i < s->num_subjects; ++i) {
+        const char *subjname = s->subjects[i].name;
+        int subj_sem = subject_semester(subjname); /* 1..8 or 0 if unknown */
+        if (subj_sem <= 0) subj_sem = 0; /* put unknown into 0 bucket (we will show later) */
+
+        /* determine display marks and attendance: if stored values are zero AND
+           subject belongs to a semester earlier than or equal to current_semester - 1,
+           produce deterministic defaults so dashboard shows meaningful data */
+        int disp_marks = s->subjects[i].marks;
         int held = s->subjects[i].classes_held;
         int att = s->subjects[i].classes_attended;
-        int pct = (held == 0) ? 0 : (int)(((double)att / held) * 100.0 + 0.5);
-        percentages[i] = pct;
+
+        if (s->current_semester > 1 && subj_sem > 0 && subj_sem < s->current_semester) {
+            /* for past semesters: if there's no real data, create deterministic defaults */
+            if (disp_marks == 0 && held == 0) {
+                unsigned int h = deterministic_hash(subjname, (unsigned int)s->id);
+                disp_marks = 45 + (h % 46); /* 45..90-ish */
+                held = 20 + (h % 21);      /* 20..40 classes held */
+                att = (held * (50 + ((h >> 8) % 51))) / 100; /* attendance 50%-100% */
+            }
+        }
+
+        /* prepare escaped subject name */
+        html_escape_buf(subjname, sname_esc, sizeof(sname_esc));
+
+        /* grade point for display */
+        int gp = (s->subjects[i].credits>0)? marks_to_grade_point_local(disp_marks) : 0;
+
+        /* build a row */
         char row[512];
-        char sname_esc[256]; html_escape_buf(s->subjects[i].name, sname_esc, sizeof(sname_esc));
-        double gp = (s->subjects[i].credits>0)? marks_to_grade_point_local(s->subjects[i].marks) : 0;
-        snprintf(row, sizeof(row),
-                 "<tr><td>%d</td><td>%s</td><td>%d</td><td>%d</td><td>%.0f</td><td>%d%%</td></tr>",
-                 i+1, sname_esc, s->subjects[i].marks, s->subjects[i].credits, gp, pct);
-        strncat(subject_rows, row, sizeof(subject_rows)-strlen(subject_rows)-1);
+        snprintf(row, sizeof(row), "<tr><td>%s</td><td>%d</td><td>%d</td><td>%.0f</td><td>%d%%</td></tr>", sname_esc, disp_marks, s->subjects[i].credits, (double)gp, (held==0?0:(int)(((double)att/held)*100.0 + 0.5)));
+
+        int semidx = subj_sem;
+        if (semidx < 0 || semidx > 8) semidx = 0;
+        if (strlen(sem_tables[semidx]) + strlen(row) + 256 > (size_t)sem_caps[semidx]) {
+            sem_caps[semidx] *= 2; /* grow but stack buffers are fixed; in practice subjects small */
+        }
+        strncat(sem_tables[semidx], row, sizeof(sem_tables[semidx]) - strlen(sem_tables[semidx]) - 1);
+
+        /* accumulate for semester attendance averages */
+        if (held > 0) {
+            sem_subject_counts[semidx]++;
+            sem_attended_sum[semidx] += att;
+            sem_held_sum[semidx] += held;
+        }
     }
-    double sgpa = compute_sgpa_local(s);
-    /* small inline SVG bar chart */
+
+    /* Build semester-wise attendance SVG (one bar per semester 1..current_semester) */
+    int max_sem = s->current_semester;
+    if (max_sem < 1) max_sem = 1;
+    if (max_sem > 8) max_sem = 8;
+    int w = 640, h = 180, pad = 28;
     char svg[4096]; svg[0]=0;
-    int w = 480, h = 160, pad = 30;
-    int barw = (maxbars>0) ? ( (w - pad*2) / maxbars - 6 ) : 20;
-    if (barw < 8) barw = 8;
     char svg_start[256];
     snprintf(svg_start, sizeof(svg_start), "<svg viewBox='0 0 %d %d' width='%d' height='%d' xmlns='http://www.w3.org/2000/svg'><rect width='100%%' height='100%%' fill='transparent'/>", w, h, w, h);
     strcpy(svg, svg_start);
     snprintf(svg + strlen(svg), sizeof(svg)-strlen(svg), "<line x1='%d' y1='%d' x2='%d' y2='%d' stroke='#eee'/>", pad, h-pad, w-pad, h-pad);
-    for (int i = 0; i < maxbars; ++i) {
-        int x = pad + i*(barw+6);
-        int barh = (percentages[i] * (h - pad*2)) / 100;
+    int barw = (max_sem>0) ? ((w - pad*2) / max_sem - 8) : 20;
+    if (barw < 8) barw = 8;
+    for (int sem = 1; sem <= max_sem; ++sem) {
+        int x = pad + (sem-1)*(barw+8);
+        int pct = 0;
+        if (sem_held_sum[sem] > 0) {
+            pct = (int)((double)sem_attended_sum[sem] / (double)sem_held_sum[sem] * 100.0 + 0.5);
+        } else {
+            /* If no data, create a deterministic default for the semester based on student id + sem */
+            unsigned int h = deterministic_hash("SEM", (unsigned int)(s->id ^ sem));
+            pct = 55 + (h % 41); /* 55..95 */
+        }
+        if (pct > 100) pct = 100;
+        int barh = (pct * (h - pad*2)) / 100;
         int y = (h - pad) - barh;
-        snprintf(svg + strlen(svg), sizeof(svg)-strlen(svg),
-                 "<rect x='%d' y='%d' width='%d' height='%d' rx='4' ry='4' fill='#3b82f6' opacity='0.85'/>",
-                 x, y, barw, barh);
-        char lbl[64]; html_escape_buf(s->subjects[i].name, lbl, sizeof(lbl));
-        if (strlen(lbl) > 18) lbl[18]='\0';
-        snprintf(svg + strlen(svg), sizeof(svg)-strlen(svg),
-                 "<text x='%d' y='%d' font-size='10' fill='#111'>%s</text>",
-                 x, h-pad+12, lbl);
+        snprintf(svg + strlen(svg), sizeof(svg)-strlen(svg), "<rect x='%d' y='%d' width='%d' height='%d' rx='6' ry='6' fill='#3b82f6' opacity='0.85'/>", x, y, barw, barh);
+        snprintf(svg + strlen(svg), sizeof(svg)-strlen(svg), "<text x='%d' y='%d' font-size='11' fill='#111'>Sem %d</text>", x, h-pad+14, sem);
+        snprintf(svg + strlen(svg), sizeof(svg)-strlen(svg), "<text x='%d' y='%d' font-size='11' fill='#111'>%d%%</text>", x, y-4, pct);
     }
     strcat(svg, "</svg>");
 
@@ -419,22 +544,41 @@ static char *build_student_dashboard(int idx) {
 
     const char *tpl_end = "<p><a href='/'>← Back to Home</a></p></div></body></html>";
 
-    size_t cap = strlen(tpl_start) + 4096 + strlen(subject_rows) + strlen(svg) + 1024;
+    size_t cap = strlen(tpl_start) + 8192 + 8192 + strlen(svg) + 2048;
     char *buf = malloc(cap);
     if (!buf) return NULL;
     strcpy(buf, tpl_start);
     char header[512];
     char dept_esc[256]; html_escape_buf(s->dept, dept_esc, sizeof(dept_esc));
+    double sgpa = compute_sgpa_local(s);
     snprintf(header, sizeof(header),
              "<h2>Welcome, %s</h2><p>ID: %d | Dept: %s | Year: %d | Semester: %d | Age: %d</p>"
              "<p><strong>SGPA (current):</strong> %.3f  &nbsp;&nbsp; <strong>Stored CGPA:</strong> %.3f (Credits: %d)</p>",
              escaped_name, s->id, dept_esc, s->year, s->current_semester, s->age, sgpa, s->cgpa, s->total_credits_completed);
     strcat(buf, header);
-    strcat(buf, "<h3>Attendance (per subject)</h3>");
+    strcat(buf, "<h3>Semester-wise Attendance</h3>");
     strcat(buf, svg);
-    strcat(buf, "<h3>Subjects & Marks</h3><table><tr><th>#</th><th>Subject</th><th>Marks</th><th>Credits</th><th>GradePoint</th><th>Attendance</th></tr>");
-    strcat(buf, subject_rows);
-    strcat(buf, "</table>");
+
+    /* For each semester, render a table if it has subjects (or if sem <= current_semester show even empty) */
+    for (int sem=1; sem<=s->current_semester && sem<=8; ++sem) {
+        char semtitle[128]; snprintf(semtitle, sizeof(semtitle), "<h3>Semester %d</h3>", sem);
+        strcat(buf, semtitle);
+        strcat(buf, "<table><tr><th>Subject</th><th>Marks</th><th>Credits</th><th>GradePoint</th><th>Attendance</th></tr>");
+        if (strlen(sem_tables[sem]) == 0) {
+            strcat(buf, "<tr><td colspan='5'>No subjects recorded for this semester.</td></tr>");
+        } else {
+            strcat(buf, sem_tables[sem]);
+        }
+        strcat(buf, "</table>");
+    }
+
+    /* Unknown/other subjects (seminar/project extras) */
+    if (strlen(sem_tables[0]) > 0) {
+        strcat(buf, "<h3>Other Subjects</h3><table><tr><th>Subject</th><th>Marks</th><th>Credits</th><th>GradePoint</th><th>Attendance</th></tr>");
+        strcat(buf, sem_tables[0]);
+        strcat(buf, "</table>");
+    }
+
     strcat(buf, tpl_end);
     return buf;
 }
@@ -486,7 +630,8 @@ static void handle_client(int client) {
                 free(qs);
             }
             if (id <= 0 || pass[0]==0) {
-                send_text(client, "400 Bad Request", "text/plain", "Missing id or pass (use the sign-in form).");
+                send_text(client, "400 Bad Request", "text/plain", "Missing id or pass (use the sign-in form).",
+                          );
                 close(client); return;
             }
             int idx = api_find_index_by_id(id);
@@ -625,7 +770,8 @@ static void handle_client(int client) {
             if (sapid <= 0 || sem < 1 || sem > 8) {
                 char resp[256];
                 snprintf(resp, sizeof(resp),
-                    "<!doctype html><html><body><p>Invalid SAP ID or semester provided.</p><p><a href='/'>Back</a></p></body></html>");
+                    "<!doctype html><html><body><p>Invalid SAP ID or semester provided.</p><p><a href='/'>Back</a></p></body></html>",
+                    s.id);
                 send_text(client, "400 Bad Request", "text/html; charset=utf-8", resp);
                 goto signup_cleanup;
             }
@@ -641,40 +787,6 @@ static void handle_client(int client) {
             s.current_semester = sem;
             s.num_subjects = 0;
             strncpy(s.password, password, sizeof(s.password)-1); s.password[sizeof(s.password)-1]=0;
-
-            /* Default semester subjects arrays */
-            const char *sem1[] = {
-                "Programming in C","Linux Lab","Problem Solving","Advanced Engineering Mathematics - I","Physics for Computer Engineers","Managing Self","Environmental Sustainability and Climate Change", NULL
-            };
-            const int sem1_c[] = {5,2,2,4,5,2,2};
-            const char *sem2[] = {
-                "Data Structures and Algorithms","Digital Electronics","Python Programming","Advanced Engineering Mathematics - II","Environmental Sustainability and Climate Change","Time and Priority Management","Elements of AI/ML", NULL
-            };
-            const int sem2_c[] = {5,3,5,4,2,2,3};
-            const char *sem3[] = {
-                "Leading Conversations","Discrete Mathematical Structures","Operating Systems","Elements of AI/ML","Database Management Systems","Design and Analysis of Algorithms", NULL
-            };
-            const int sem3_c[] = {2,3,3,3,5,4};
-            const char *sem4[] = {
-                "Software Engineering","EDGE - Soft Skills","Linear Algebra","Indian Constitution","Writing with Impact","Object Oriented Programming","Data Communication and Networks","Applied Machine Learning", NULL
-            };
-            const int sem4_c[] = {3,0,3,0,2,4,4,5};
-            const char *sem5[] = {
-                "Cryptography and Network Security","Formal Languages and Automata Theory","Object Oriented Analysis and Design","Exploratory-3","Start your Startup","Research Methodology in CS","Probability, Entropy, and MC Simulation","PE-2","PE-2 Lab", NULL
-            };
-            const int sem5_c[] = {3,3,3,3,2,3,3,4,1};
-            const char *sem6[] = {
-                "Exploratory-4","Leadership and Teamwork","Compiler Design","Statistics and Data Analysis","PE-3","PE-3 Lab","Minor Project", NULL
-            };
-            const int sem6_c[] = {3,2,3,3,4,1,5};
-            const char *sem7[] = {
-                "Exploratory-5","PE-4","PE-4 Lab","PE-5","PE-5 Lab","Capstone Project - Phase-1","Summer Internship", NULL
-            };
-            const int sem7_c[] = {3,4,1,3,1,5,1};
-            const char *sem8[] = {
-                "IT Ethical Practices","Capstone Project - Phase-2", NULL
-            };
-            const int sem8_c[] = {3,5};
 
             for (int cur=1; cur<=sem; ++cur) {
                 if (cur==1) add_subjects_to_student(&s, sem1, sem1_c);
