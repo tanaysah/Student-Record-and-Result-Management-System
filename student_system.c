@@ -47,8 +47,7 @@
 #define MAX_TITLE 160
 #define MAX_CODE 32
 
-Student students[MAX_STUDENTS];
-int student_count = 0;
+
 
 /* ---------- Types ---------- */
 typedef struct {
@@ -83,8 +82,8 @@ typedef struct {
 } AttRec;
 
 /* ---------- In-memory storage ---------- */
-static Student students[MAX_STUDENTS];
-static int student_count = 0;
+Student students[MAX_STUDENTS];
+int student_count = 0;
 
 static SubjectRec subjects[MAX_SUBJECTS];
 static int subject_count = 0;
@@ -999,6 +998,7 @@ int main(int argc, char **argv) {
     return 0;
   */
 }
+
 
 
 
