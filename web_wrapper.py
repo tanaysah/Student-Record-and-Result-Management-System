@@ -1,203 +1,172 @@
 #!/usr/bin/env python3
-# web_wrapper.py
-# In-memory Flask web UI for Student Record & Result Management System
-# - All data is kept in memory (no files written). Exiting the process clears everything.
-# - Browser UI with CSS textures, colors, padding and smooth transitions.
-# - Admin & Student signup/login, subjects by semester, marks/attendance (update, no duplicates),
-#   SGPA & CGPA calculation (credit-weighted).
-# - Health route and binds to PORT when run directly or under gunicorn.
-#
-# Dependencies: flask, optional passlib for stronger hashing.
-# Put in requirements.txt: flask, passlib (optional).
-#
-# Run locally:
-#   export PORT=8080
-#   python3 web_wrapper.py
-# Or with Gunicorn on Render:
-#   gunicorn web_wrapper:app --bind 0.0.0.0:$PORT
+"""
+web_wrapper.py - In-memory Flask Student Record & Result Management System
 
-import os, uuid, math, html, time
+- Entirely in-memory: nothing is written to disk. When process stops, all data is gone.
+- Simple, robust password hashing using salted SHA256 (no passlib/bcrypt required).
+- Clean browser UI (single-file template) with subjects-by-semester, students, marks, attendance,
+  SGPA/CGPA calculation, admin/student login & signup, and a /health endpoint.
+- Safe demo-run: will call a compiled C binary *if present and executable*, but won't fail if it's missing.
+- Run:
+    export PORT=8080
+    python3 web_wrapper.py
+  Or with Gunicorn:
+    pip install flask gunicorn
+    gunicorn web_wrapper:app --bind 0.0.0.0:$PORT
+"""
+
+import os
+import uuid
+import time
+import hashlib
+import subprocess
+import html
 from functools import wraps
-from flask import Flask, render_template_string, request, redirect, url_for, session, flash, jsonify
+from flask import (
+    Flask, render_template_string, request, redirect, url_for, session, flash, jsonify
+)
 
-# optional passlib
-try:
-    from passlib.hash import bcrypt
-    HAS_PASSLIB = True
-    # disable bcrypt backend if it's broken
-    try:
-        bcrypt.verify  # access to ensure backend availability
-    except Exception:
-        HAS_PASSLIB = False
-except Exception:
-    HAS_PASSLIB = False
-
-
+# --------- Configuration ----------
 app = Flask(__name__)
 app.secret_key = os.environ.get("SECRET_KEY", str(uuid.uuid4()))
 PORT = int(os.environ.get("PORT", "8080"))
-IN_MEMORY = True  # keep everything ephemeral
+IN_MEMORY = True  # explicit: keep everything in memory
 
-# ---------- In-memory stores ----------
-USERS = {}      # email -> {id,name,email,phone,role,password_hash}
-STUDENTS = {}   # user_id -> {id,user_id,roll,program}
-SUBJECTS = {}   # subject_id -> {id,code,title,credits,semester}
-MARKS = {}      # (student_id,subject_id) -> marks (float)
-ATT = {}        # (student_id,subject_id) -> (present_days,total_days)
+# Optional compiled demo binary (will be used only if present)
+BINARY = "./student_system"  # leave as-is; safe_run_demo checks file/executable
 
-# ---------- Utilities ----------
+# --------- In-memory data stores ----------
+USERS = {}       # email -> {id,name,email,phone,role,password_hash}
+STUDENTS = {}    # student_id -> {id,user_id,roll,program}
+SUBJECTS = {}    # subject_id -> {id,code,title,credits,semester}
+MARKS = {}       # (student_id,subject_id) -> float marks (0-100)
+ATT = {}         # (student_id,subject_id) -> (present_days, total_days)
+
+# --------- Utilities ----------
 def uid():
     return str(uuid.uuid4())
 
-def hash_password(pwd):
-    if HAS_PASSLIB:
-        return bcrypt.hash(pwd)
-    else:
-        import hashlib, os
-        salt = os.urandom(8).hex()
-        return salt + "$" + hashlib.sha256((salt + pwd).encode()).hexdigest()
+def salt_and_hash(password: str) -> str:
+    """Return salt$hexsha256(salt+password). Deterministic, simple, secure enough for ephemeral demo."""
+    salt = os.urandom(8).hex()
+    h = hashlib.sha256((salt + password).encode("utf-8")).hexdigest()
+    return f"{salt}${h}"
 
-def verify_password(pwd, stored):
-    if HAS_PASSLIB and isinstance(stored, str) and stored.startswith("$2"):
-        try:
-            return bcrypt.verify(pwd, stored)
-        except Exception:
-            return False
-    else:
-        try:
-            salt, digest = stored.split("$", 1)
-            import hashlib
-            return hashlib.sha256((salt + pwd).encode()).hexdigest() == digest
-        except Exception:
-            return False
+def verify_hash(password: str, stored: str) -> bool:
+    try:
+        salt, digest = stored.split("$", 1)
+        return hashlib.sha256((salt + password).encode("utf-8")).hexdigest() == digest
+    except Exception:
+        return False
 
 def ensure_default_admin():
+    """Create admin@local / admin123 if no admin exists."""
     if not any(u["role"] == "admin" for u in USERS.values()):
-        h = hash_password("admin123")
-        u = {"id": uid(), "name": "Administrator", "email": "admin@local", "phone": "", "role": "admin", "password_hash": h}
-        USERS[u["email"]] = u
+        passwd = "admin123"
+        USERS["admin@local"] = {
+            "id": uid(),
+            "name": "Administrator",
+            "email": "admin@local",
+            "phone": "",
+            "role": "admin",
+            "password_hash": salt_and_hash(passwd)
+        }
 
 def login_required(role=None):
     def deco(f):
         @wraps(f)
-        def wrapped(*a, **kw):
+        def wrapped(*args, **kwargs):
             if "user_email" not in session:
-                flash("Please login to continue", "warning")
+                flash("Please login first", "warning")
                 return redirect(url_for("index"))
-            u = USERS.get(session["user_email"])
-            if not u:
+            user = USERS.get(session["user_email"])
+            if not user:
                 session.pop("user_email", None)
-                flash("Session expired, please login again", "warning")
+                flash("Session expired — please log in again", "warning")
                 return redirect(url_for("index"))
-            if role and u["role"] != role:
+            if role and user["role"] != role:
                 flash("Access denied", "danger")
                 return redirect(url_for("index"))
-            return f(*a, **kw)
+            return f(*args, **kwargs)
         return wrapped
     return deco
 
-def compute_sgpa(student_id, semester):
-    # gp = (marks/100)*10, weighted by credits
+def compute_sgpa(student_id: str, semester: int):
     total_weighted = 0.0
     total_credits = 0
-    for s in SUBJECTS.values():
-        if s["semester"] != semester:
+    for subj in SUBJECTS.values():
+        if subj["semester"] != semester:
             continue
-        key = (student_id, s["id"])
+        key = (student_id, subj["id"])
         if key in MARKS:
-            marks = MARKS[key]
-            gp = (marks / 100.0) * 10.0
-            total_weighted += gp * s["credits"]
-            total_credits += s["credits"]
+            mark = MARKS[key]
+            gp = (mark / 100.0) * 10.0
+            total_weighted += gp * subj["credits"]
+            total_credits += subj["credits"]
     if total_credits == 0:
         return None
     return total_weighted / total_credits
 
-def compute_cgpa(student_id):
+def compute_cgpa(student_id: str):
     total_weighted = 0.0
     total_credits = 0
-    for s in SUBJECTS.values():
-        key = (student_id, s["id"])
+    for subj in SUBJECTS.values():
+        key = (student_id, subj["id"])
         if key in MARKS:
-            marks = MARKS[key]
-            gp = (marks / 100.0) * 10.0
-            total_weighted += gp * s["credits"]
-            total_credits += s["credits"]
+            mark = MARKS[key]
+            gp = (mark / 100.0) * 10.0
+            total_weighted += gp * subj["credits"]
+            total_credits += subj["credits"]
     if total_credits == 0:
         return None
     return total_weighted / total_credits
 
-# ---------- Demo helper (keeps original behavior if compiled C exists) ----------
-BINARY = "./student_system"
 def safe_run_demo():
-    # try to run compiled binary in demo mode if it exists, else return a friendly message
+    """If compiled C demo exists and is executable, run it with --demo and return escaped output (short)."""
     try:
         if os.path.isfile(BINARY) and os.access(BINARY, os.X_OK):
-            import subprocess
-            p = subprocess.run([BINARY, "--demo"], capture_output=True, text=True, timeout=6)
-            out = p.stdout.strip() or p.stderr.strip() or "(program produced no output)"
+            proc = subprocess.run([BINARY, "--demo"], capture_output=True, text=True, timeout=6)
+            out = proc.stdout.strip() or proc.stderr.strip() or "(program produced no output)"
             if len(out) > 3000:
                 out = out[:3000] + "\n\n...truncated..."
             return html.escape(out)
     except Exception as e:
-        return f"(error running demo: {html.escape(str(e))})"
-    return "(demo binary not found; this is an in-memory web UI demo)"
+        return f"(demo run error: {html.escape(str(e))})"
+    return "(demo binary not found; UI is in-memory-only)"
 
-# ---------- Templates (single-file) ----------
-BASE_HTML = """
-<!doctype html>
-<html lang="en">
+# --------- HTML template (single-file) ----------
+PAGE = """<!doctype html>
+<html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Student Record & Result Management</title>
+<title>Student Record & Result Management (In-memory)</title>
 <style>
-:root{
-  --bg:#0f1724; --card:#0b1220; --accent:#06b6d4; --muted:#94a3b8; --panel:#071023;
-  --glass: rgba(255,255,255,0.03);
-}
-*{box-sizing:border-box}
-body{margin:0;font-family:Inter,Segoe UI,Roboto,Arial;background:linear-gradient(180deg,#071428 0%, #0b1220 60%); color:#e6eef6; -webkit-font-smoothing:antialiased;}
-.app{max-width:1100px;margin:34px auto;padding:22px;}
-.header{display:flex;align-items:center;gap:18px;padding:18px;border-radius:14px;background:linear-gradient(90deg, rgba(255,255,255,0.03), rgba(255,255,255,0.02));box-shadow:0 6px 24px rgba(2,6,23,0.6)}
-.logo{width:64px;height:64px;border-radius:12px;background:linear-gradient(135deg,var(--accent),#7c3aed);display:flex;align-items:center;justify-content:center;font-weight:700}
-.title h1{margin:0;font-size:20px}
-.title p{margin:2px 0 0;color:var(--muted);font-size:13px}
-.container{display:flex;gap:18px;margin-top:18px;align-items:flex-start}
+:root{--bg:#071428;--card:#0b1220;--accent:#06b6d4;--muted:#94a3b8; --glass: rgba(255,255,255,0.03)}
+*{box-sizing:border-box;font-family:Inter,system-ui,Arial}
+body{margin:0;background:linear-gradient(180deg,#071428 0%,#0b1220 80%);color:#e6eef6;padding:24px}
+.app{max-width:1100px;margin:0 auto}
+.header{display:flex;align-items:center;gap:16px;background:linear-gradient(90deg,rgba(255,255,255,0.02),rgba(255,255,255,0.01));padding:16px;border-radius:12px}
+.logo{width:56px;height:56px;border-radius:10px;background:linear-gradient(135deg,var(--accent),#7c3aed);display:flex;align-items:center;justify-content:center;font-weight:700}
+.title h1{margin:0;font-size:18px}
+.title p{margin:4px 0 0;color:var(--muted);font-size:13px}
+.container{display:flex;gap:18px;margin-top:18px}
 .left{flex:2}
 .right{flex:1;min-width:280px}
-.card{background:linear-gradient(180deg, rgba(255,255,255,0.03), rgba(255,255,255,0.01));border-radius:12px;padding:16px;box-shadow:0 8px 28px rgba(2,6,23,0.5)}
-.controls{display:flex;gap:8px;flex-wrap:wrap}
-.btn{background:transparent;border:1px solid rgba(255,255,255,0.06);padding:8px 12px;border-radius:8px;color:inherit;cursor:pointer;transition:all .18s}
-.btn:hover{transform:translateY(-3px);box-shadow:0 6px 18px rgba(2,6,23,0.5)}
-.btn.primary{background:linear-gradient(90deg,var(--accent),#7c3aed);color:#071428;border:0}
-.small{font-size:13px;padding:6px 10px}
-.pre{background:linear-gradient(180deg,rgba(255,255,255,0.03),rgba(255,255,255,0.02));padding:12px;border-radius:8px;color:var(--muted);white-space:pre-wrap}
-.list{margin:0;padding:0;list-style:none}
-.list li{padding:8px 6px;border-radius:8px;display:flex;justify-content:space-between;align-items:center}
-.hr{height:1px;background:linear-gradient(90deg,rgba(255,255,255,0.02),rgba(255,255,255,0.03));margin:12px 0;border-radius:2px}
+.card{background:linear-gradient(180deg,rgba(255,255,255,0.02),rgba(255,255,255,0.01));padding:14px;border-radius:12px;box-shadow:0 8px 28px rgba(2,6,23,0.6)}
+.controls{display:flex;gap:8px}
+.btn{background:transparent;border:1px solid rgba(255,255,255,0.06);padding:8px 12px;border-radius:8px;color:inherit;cursor:pointer;text-decoration:none}
+.btn.primary{background:linear-gradient(90deg,var(--accent),#7c3aed);color:#041020;border:0}
 .form-row{display:flex;gap:8px;margin-bottom:8px}
-.input, textarea, select{background:transparent;border:1px solid rgba(255,255,255,0.06);padding:10px;border-radius:8px;color:inherit;min-width:0}
-textarea{min-height:80px}
-.notice{padding:8px;border-radius:8px;background:linear-gradient(90deg, rgba(255,255,255,0.02), rgba(255,255,255,0.01));color:var(--muted)}
-.meta{font-size:12px;color:var(--muted)}
-.fade-enter{opacity:0;transform:translateY(6px)}
-.fade-enter-active{opacity:1;transform:none;transition:all .28s ease}
-.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:10px}
-.small-muted{font-size:12px;color:var(--muted)}
-.topbar{display:flex;justify-content:space-between;gap:12px;align-items:center;margin-bottom:12px}
-.badge{padding:6px 8px;border-radius:999px;background:rgba(255,255,255,0.03);font-size:13px}
-.footer{margin-top:18px;color:var(--muted);font-size:13px;text-align:center}
-@media(max-width:880px){.container{flex-direction:column}.right{min-width:unset}}
+.input, select, textarea{background:transparent;border:1px solid rgba(255,255,255,0.06);padding:10px;border-radius:8px;color:inherit}
+.pre{background:rgba(255,255,255,0.02);padding:12px;border-radius:8px;color:var(--muted);white-space:pre-wrap}
+.hr{height:1px;background:linear-gradient(90deg,rgba(255,255,255,0.02),rgba(255,255,255,0.03));margin:12px 0;border-radius:4px}
+.list{list-style:none;padding:0;margin:0}
+.list li{display:flex;justify-content:space-between;align-items:center;padding:8px 6px;border-radius:8px}
+.small{font-size:13px;color:var(--muted)}
+.footer{margin-top:14px;color:var(--muted);text-align:center;font-size:13px}
+@media(max-width:900px){.container{flex-direction:column}.right{min-width:unset}}
 </style>
-<script>
-function show(id){
-  document.querySelectorAll('.panel').forEach(p=>p.style.display='none');
-  const el = document.getElementById(id);
-  if(el){ el.style.display='block'; el.classList.add('fade-enter'); setTimeout(()=>el.classList.remove('fade-enter'),10); }
-}
-function confirmAction(msg, href){ if(confirm(msg)){ window.location=href; } }
-</script>
 </head>
 <body>
 <div class="app">
@@ -205,95 +174,105 @@ function confirmAction(msg, href){ if(confirm(msg)){ window.location=href; } }
     <div class="logo">SR</div>
     <div class="title">
       <h1>STUDENT RECORD && RESULT MANAGEMENT SYSTEM</h1>
-      <p>Programming in C Semester &nbsp;|&nbsp; Made by - Tanay Sah (590023170) - Mahika Jaglan (590025346)</p>
+      <p>Programming in C Semester — Made by Tanay Sah (590023170) & Mahika Jaglan (590025346)</p>
     </div>
-    <div style="margin-left:auto" class="meta">
-      {% if user %}
-        <div class="badge">Signed in: {{ user.name }} ({{ user.role }})</div>
-      {% else %}
-        <div class="badge">Not signed in</div>
-      {% endif %}
+    <div style="margin-left:auto" class="small">
+      {% if user %}Signed in: {{ user.name }} ({{ user.role }}){% else %}Not signed in{% endif %}
     </div>
   </div>
 
-  <div class="container">
+  <div class="container" style="margin-top:18px">
     <div class="left">
-      <!-- MAIN PANELS -->
-      <div id="panel-home" class="card panel" style="display:block">
-        <div class="topbar">
-          <div><strong>Dashboard</strong> <span class="small-muted">— In-memory demo UI</span></div>
+      <div class="card">
+        <div style="display:flex;justify-content:space-between;align-items:center">
+          <div><strong>Dashboard</strong> <span class="small">— In-memory demo</span></div>
           <div class="controls">
             {% if not user %}
-              <a class="btn" href="{{ url_for('index') }}?show=login">Login</a>
-              <a class="btn" href="{{ url_for('index') }}?show=signup">Signup</a>
+              <a class="btn" href="#login" onclick="document.getElementById('login-form').style.display='block'">Login</a>
+              <a class="btn" href="#signup" onclick="document.getElementById('signup-form').style.display='block'">Signup</a>
             {% else %}
               <a class="btn" href="{{ url_for('logout') }}">Logout</a>
             {% endif %}
           </div>
         </div>
 
-        <div class="grid">
-          <div class="card">
-            <div style="display:flex;justify-content:space-between;align-items:center">
-              <div><strong>Sample Program Output</strong><div class="small-muted">demo run</div></div>
-              <div><a class="btn small" href="{{ url_for('run_demo') }}">Run Demo</a></div>
-            </div>
-            <div class="hr"></div>
-            <pre class="pre">{{ demo_output }}</pre>
-          </div>
-
-          <div class="card">
-            <strong>Quick Actions</strong>
-            <div class="hr"></div>
-            <div style="display:flex;flex-direction:column;gap:8px">
-              <a class="btn" href="#" onclick="show('panel-subjects')">View Subjects</a>
-              <a class="btn" href="#" onclick="show('panel-marks')">Enter Marks</a>
-              <a class="btn" href="#" onclick="show('panel-att')">Enter Attendance</a>
-              <a class="btn" href="#" onclick="show('panel-students')">Students</a>
-            </div>
-          </div>
-        </div>
-
         <div class="hr"></div>
 
-        <div style="display:flex;gap:12px">
-          <div style="flex:1" class="notice">
-            <strong>Ephemeral mode:</strong> All data lives in memory — when this process stops, data is lost.
+        <div style="display:grid;grid-template-columns:1fr 360px;gap:12px">
+          <div>
+            <div class="card" style="margin-bottom:12px">
+              <div style="display:flex;justify-content:space-between">
+                <div><strong>Sample Program Output</strong><div class="small">Demo run</div></div>
+                <div><a class="btn" href="{{ url_for('run_demo') }}">Run Demo</a></div>
+              </div>
+              <div class="hr"></div>
+              <pre class="pre">{{ demo_output }}</pre>
+            </div>
+
+            <div class="card">
+              <strong>Quick Actions</strong>
+              <div class="hr"></div>
+              <div style="display:flex;gap:8px;flex-wrap:wrap">
+                <a class="btn" href="#subjects" onclick="document.getElementById('subjects').scrollIntoView()">Subjects</a>
+                <a class="btn" href="#marks" onclick="document.getElementById('marks').scrollIntoView()">Enter Marks</a>
+                <a class="btn" href="#att" onclick="document.getElementById('att').scrollIntoView()">Attendance</a>
+                <a class="btn" href="#students" onclick="document.getElementById('students').scrollIntoView()">Students</a>
+              </div>
+            </div>
           </div>
-          <div style="width:220px;text-align:right">
-            <div class="small-muted">Server time</div>
-            <div>{{ now }}</div>
+
+          <div>
+            <div class="card" style="margin-bottom:12px">
+              <strong>Summary</strong>
+              <div class="hr"></div>
+              <div class="small">Subjects: {{ total_subjects }} &nbsp;|&nbsp; Students: {{ total_students }}</div>
+              <div class="small">Marks: {{ total_marks }} &nbsp;|&nbsp; Attendance: {{ total_att }}</div>
+              <div style="margin-top:10px">
+                <div class="small">Server time: {{ now }}</div>
+              </div>
+            </div>
+
+            <div class="card">
+              <strong>Signed-in user</strong>
+              <div class="hr"></div>
+              {% if user %}
+                <div><strong>{{ user.name }}</strong></div>
+                <div class="small">{{ user.email }}</div>
+                <div class="small">{{ user.phone }}</div>
+              {% else %}
+                <div class="small">No user signed in</div>
+              {% endif %}
+            </div>
           </div>
         </div>
       </div>
 
-      <!-- Subjects Panel -->
-      <div id="panel-subjects" class="panel card" style="display:none">
-        <div style="display:flex;justify-content:space-between;align-items:center">
+      <!-- Subjects -->
+      <div id="subjects" class="card" style="margin-top:12px">
+        <div style="display:flex;justify-content:space-between">
           <div><strong>Subjects (by semester)</strong></div>
-          <div><a class="btn" href="#" onclick="show('panel-home')">Back</a></div>
+          <div><small class="small">Admin only: add/delete</small></div>
         </div>
         <div class="hr"></div>
-        <div style="margin-bottom:12px">
-          <form method="post" action="{{ url_for('add_subject') }}">
-            <div class="form-row">
-              <input class="input" name="code" placeholder="Code e.g. CS101" required>
-              <input class="input" name="title" placeholder="Title" required>
-            </div>
-            <div class="form-row">
-              <input class="input" name="credits" placeholder="Credits (int)" required>
-              <input class="input" name="semester" placeholder="Semester (int)" required>
-              <button class="btn primary small" type="submit">Add Subject</button>
-            </div>
-          </form>
-        </div>
+        <form method="post" action="{{ url_for('add_subject') }}">
+          <div class="form-row">
+            <input name="code" class="input" placeholder="Code e.g. CS101" required>
+            <input name="title" class="input" placeholder="Title" required>
+          </div>
+          <div class="form-row">
+            <input name="credits" class="input" placeholder="Credits (int)" required>
+            <input name="semester" class="input" placeholder="Semester (int)" required>
+            <button class="btn primary" type="submit">Add Subject</button>
+          </div>
+        </form>
 
+        <div class="hr"></div>
         {% if subjects_by_sem %}
           {% for sem, subs in subjects_by_sem.items() %}
-            <div style="margin-bottom:12px" class="card">
-              <div style="display:flex;justify-content:space-between;align-items:center">
+            <div style="margin-bottom:10px" class="card">
+              <div style="display:flex;justify-content:space-between">
                 <div><strong>Semester {{ sem }}</strong></div>
-                <div class="small-muted">{{ subs|length }} subjects</div>
+                <div class="small">{{ subs|length }} subjects</div>
               </div>
               <div class="hr"></div>
               <ul class="list">
@@ -301,11 +280,11 @@ function confirmAction(msg, href){ if(confirm(msg)){ window.location=href; } }
                   <li>
                     <div>
                       <div><strong>{{ s.code }}</strong> — {{ s.title }}</div>
-                      <div class="small-muted">Credits: {{ s.credits }}</div>
+                      <div class="small">Credits: {{ s.credits }}</div>
                     </div>
                     <div>
-                      <form method="post" action="{{ url_for('delete_subject', sid=s.id) }}" style="display:inline">
-                        <button class="btn small" onclick="return confirm('Delete subject?');">Delete</button>
+                      <form method="post" action="{{ url_for('delete_subject', sid=s.id) }}">
+                        <button class="btn" onclick="return confirm('Delete subject?');">Delete</button>
                       </form>
                     </div>
                   </li>
@@ -314,18 +293,14 @@ function confirmAction(msg, href){ if(confirm(msg)){ window.location=href; } }
             </div>
           {% endfor %}
         {% else %}
-          <div class="notice">No subjects yet. Add one above.</div>
+          <div class="small">No subjects yet.</div>
         {% endif %}
       </div>
 
-      <!-- Marks Panel -->
-      <div id="panel-marks" class="panel card" style="display:none">
-        <div style="display:flex;justify-content:space-between;align-items:center">
-          <div><strong>Enter / Update Marks</strong></div>
-          <div><a class="btn" href="#" onclick="show('panel-home')">Back</a></div>
-        </div>
+      <!-- Marks -->
+      <div id="marks" class="card" style="margin-top:12px">
+        <div style="display:flex;justify-content:space-between"><div><strong>Enter / Update Marks</strong></div></div>
         <div class="hr"></div>
-
         <form method="post" action="{{ url_for('enter_marks') }}">
           <div class="form-row">
             <select name="student_id" class="input" required>
@@ -343,7 +318,7 @@ function confirmAction(msg, href){ if(confirm(msg)){ window.location=href; } }
           </div>
           <div class="form-row">
             <input name="marks" class="input" placeholder="Marks (0-100)" required>
-            <button class="btn primary small" type="submit">Save</button>
+            <button class="btn primary" type="submit">Save</button>
           </div>
         </form>
 
@@ -352,25 +327,18 @@ function confirmAction(msg, href){ if(confirm(msg)){ window.location=href; } }
         <ul class="list">
           {% if marks_list %}
             {% for m in marks_list %}
-              <li>
-                <div>{{ m.student_roll }} / {{ m.student_name }} — {{ m.subject_code }} ({{ m.subject_title }})</div>
-                <div>{{ "%.2f"|format(m.marks) }}</div>
-              </li>
+              <li><div>{{ m.student_roll }} / {{ m.student_name }} — {{ m.subject_code }}</div><div>{{ "%.2f"|format(m.marks) }}</div></li>
             {% endfor %}
           {% else %}
-            <li class="small-muted">No marks recorded yet.</li>
+            <li class="small">No marks recorded yet.</li>
           {% endif %}
         </ul>
       </div>
 
-      <!-- Attendance Panel -->
-      <div id="panel-att" class="panel card" style="display:none">
-        <div style="display:flex;justify-content:space-between;align-items:center">
-          <div><strong>Enter / Update Attendance</strong></div>
-          <div><a class="btn" href="#" onclick="show('panel-home')">Back</a></div>
-        </div>
+      <!-- Attendance -->
+      <div id="att" class="card" style="margin-top:12px">
+        <div style="display:flex;justify-content:space-between"><div><strong>Enter / Update Attendance</strong></div></div>
         <div class="hr"></div>
-
         <form method="post" action="{{ url_for('enter_attendance') }}">
           <div class="form-row">
             <select name="student_id" class="input" required>
@@ -387,171 +355,84 @@ function confirmAction(msg, href){ if(confirm(msg)){ window.location=href; } }
             </select>
           </div>
           <div class="form-row">
-            <input name="present" class="input" placeholder="Present days (int)" required>
-            <input name="total" class="input" placeholder="Total days (int)" required>
-            <button class="btn primary small" type="submit">Save</button>
+            <input name="present" class="input" placeholder="Present days" required>
+            <input name="total" class="input" placeholder="Total days" required>
+            <button class="btn primary" type="submit">Save</button>
           </div>
         </form>
       </div>
 
-      <!-- Students Panel -->
-      <div id="panel-students" class="panel card" style="display:none">
-        <div style="display:flex;justify-content:space-between;align-items:center">
-          <div><strong>Students</strong></div>
-          <div><a class="btn" href="#" onclick="show('panel-home')">Back</a></div>
-        </div>
+      <!-- Students -->
+      <div id="students" class="card" style="margin-top:12px">
+        <div style="display:flex;justify-content:space-between"><div><strong>Students</strong></div></div>
         <div class="hr"></div>
-        <div style="margin-bottom:12px">
-          <form method="post" action="{{ url_for('signup') }}">
-            <div class="form-row">
-              <input class="input" name="name" placeholder="Full name" required>
-              <input class="input" name="email" placeholder="Email" required>
-            </div>
-            <div class="form-row">
-              <input class="input" name="phone" placeholder="Phone">
-              <input class="input" name="password" placeholder="Password" required>
-            </div>
-            <div class="form-row">
-              <input class="input" name="roll" placeholder="Roll" required>
-              <input class="input" name="program" placeholder="Program (e.g., B.E.)">
-              <button class="btn primary small" type="submit">Create Student</button>
-            </div>
-          </form>
-        </div>
 
-        <div>
-          <ul class="list">
-            {% if students %}
-              {% for st in students %}
-                <li>
-                  <div>
-                    <strong>{{ st.roll }}</strong> — {{ st.program }} <div class="small-muted">{{ st_name_map[st.user_id] }} • {{ st_email_map[st.user_id] }}</div>
-                  </div>
-                  <div>
-                    <a class="btn small" href="{{ url_for('view_student', sid=st.id) }}">View</a>
-                    <form method="post" action="{{ url_for('delete_student', sid=st.id) }}" style="display:inline">
-                      <button class="btn small" onclick="return confirm('Delete student?');">Delete</button>
-                    </form>
-                  </div>
-                </li>
-              {% endfor %}
-            {% else %}
-              <li class="small-muted">No students yet.</li>
-            {% endif %}
-          </ul>
-        </div>
-      </div>
-
-      <!-- Student Detail -->
-      <div id="panel-student-detail" class="panel card" style="display:none">
-        {% if detail %}
-          <div style="display:flex;justify-content:space-between;align-items:center">
-            <div><strong>Student: {{ detail.name }} ({{ detail.roll }})</strong></div>
-            <div><a class="btn" href="#" onclick="show('panel-students')">Back</a></div>
+        <form id="signup-form" method="post" action="{{ url_for('signup') }}" style="display:none">
+          <div class="form-row">
+            <input name="name" class="input" placeholder="Full name" required>
+            <input name="email" class="input" placeholder="Email" required>
           </div>
-          <div class="hr"></div>
-          <div style="display:flex;gap:12px;flex-wrap:wrap">
-            <div class="card" style="flex:1">
-              <div class="small-muted">Contact</div>
-              <div>{{ detail.email }} • {{ detail.phone }}</div>
-            </div>
-            <div class="card" style="flex:1">
-              <div class="small-muted">Program</div>
-              <div>{{ detail.program }}</div>
-            </div>
-            <div class="card" style="flex:1">
-              <div class="small-muted">CGPA</div>
-              <div>{{ detail.cgpa if detail.cgpa is not none else 'N/A' }}</div>
-            </div>
+          <div class="form-row">
+            <input name="phone" class="input" placeholder="Phone">
+            <input name="password" class="input" placeholder="Password" required>
           </div>
+          <div class="form-row">
+            <input name="roll" class="input" placeholder="Roll" required>
+            <input name="program" class="input" placeholder="Program">
+            <button class="btn primary" type="submit">Create Student</button>
+          </div>
+        </form>
 
-          <div class="hr"></div>
-          {% for sem, subs in detail.semesters.items() %}
-            <div class="card" style="margin-bottom:8px">
-              <div style="display:flex;justify-content:space-between"><strong>Semester {{ sem }}</strong><div class="small-muted">SGPA: {{ detail.sgpa.get(sem,'N/A') }}</div></div>
-              <div class="hr"></div>
-              <ul class="list">
-                {% for sub in subs %}
-                  <li>
-                    <div>{{ sub.code }} — {{ sub.title }} <div class="small-muted">Credits: {{ sub.credits }}</div></div>
-                    <div>
-                      <div class="small-muted">Marks: {{ sub.marks if sub.marks is not none else 'N/A' }}</div>
-                      <div class="small-muted">Att: {{ sub.att if sub.att is not none else 'N/A' }}</div>
-                    </div>
-                  </li>
-                {% endfor %}
-              </ul>
-            </div>
-          {% endfor %}
-        {% endif %}
+        <div class="hr"></div>
+        <ul class="list">
+          {% if students %}
+            {% for st in students %}
+              <li>
+                <div><strong>{{ st.roll }}</strong> — {{ st.program }} <div class="small">{{ st_name_map[st.user_id] }} • {{ st_email_map[st.user_id] }}</div></div>
+                <div>
+                  <a class="btn" href="{{ url_for('view_student', sid=st.id) }}">View</a>
+                  <form method="post" action="{{ url_for('delete_student', sid=st.id) }}" style="display:inline">
+                    <button class="btn" onclick="return confirm('Delete student?');">Delete</button>
+                  </form>
+                </div>
+              </li>
+            {% endfor %}
+          {% else %}
+            <li class="small">No students yet.</li>
+          {% endif %}
+        </ul>
       </div>
 
     </div>
 
     <div class="right">
       <div class="card">
-        <strong>Signed-in user</strong>
+        <strong>Login</strong>
         <div class="hr"></div>
-        {% if user %}
-          <div><strong>{{ user.name }}</strong></div>
-          <div class="small-muted">{{ user.email }}</div>
-          <div class="small-muted">{{ user.phone }}</div>
-          <div style="margin-top:8px"><a class="btn" href="{{ url_for('logout') }}">Logout</a></div>
-        {% else %}
-          <div class="small-muted">No user signed in</div>
-          <div style="margin-top:8px">
-            <a class="btn" href="{{ url_for('index') }}?show=login">Login</a>
-            <a class="btn" href="{{ url_for('index') }}?show=signup">Signup</a>
-          </div>
-        {% endif %}
+        <form id="login-form" method="post" action="{{ url_for('login') }}">
+          <div class="form-row"><input name="email" class="input" placeholder="Email" required></div>
+          <div class="form-row"><input name="password" class="input" placeholder="Password" required></div>
+          <div class="form-row"><button class="btn primary" type="submit">Login</button></div>
+        </form>
       </div>
 
       <div style="height:12px"></div>
 
       <div class="card">
-        <strong>Summary</strong>
+        <strong>Info</strong>
         <div class="hr"></div>
-        <div class="small-muted">Subjects: {{ total_subjects }} | Students: {{ total_students }}</div>
-        <div class="small-muted">Marks recorded: {{ total_marks }} | Attendance records: {{ total_att }}</div>
-      </div>
-
-      <div style="height:12px"></div>
-
-      <div class="card">
-        <strong>Notes</strong>
-        <div class="hr"></div>
-        <div class="meta">All edits are ephemeral — restart clears data.</div>
+        <div class="small">All data is ephemeral — restart clears everything.</div>
       </div>
     </div>
   </div>
 
-  <div class="footer">
-    <div class="meta">Server: In-memory demo • Time: {{ now }}</div>
-  </div>
+  <div class="footer"><div class="small">Server time: {{ now }}</div></div>
 </div>
-
-<script>
-  // show panel based on query param
-  (function(){
-    const params = new URLSearchParams(window.location.search);
-    const show = params.get('show');
-    if(show) showPanel(show);
-    function showPanel(s){
-      const mapping = {login:'panel-students', signup:'panel-students', subjects:'panel-subjects', marks:'panel-marks', att:'panel-att', students:'panel-students'};
-      const id = mapping[s] || s;
-      if(document.getElementById(id)) show(id);
-    }
-    if(location.hash){
-      const target = location.hash.replace('#','');
-      if(target && document.getElementById(target)) show(target);
-    }
-  })();
-</script>
 </body>
 </html>
 """
 
-# ---------- Routes ----------
+# --------- Routes ----------
 @app.route("/health")
 def health():
     return jsonify({"status": "ok"}), 200
@@ -563,31 +444,21 @@ def run_demo():
 @app.route("/", methods=["GET"])
 def index():
     ensure_default_admin()
-    # build view context
     user = USERS.get(session.get("user_email"))
     demo_output = safe_run_demo()
-    # prepare subjects grouped by semester
+    # subjects grouped by semester
     subs = sorted(SUBJECTS.values(), key=lambda s: (s["semester"], s["code"]))
     subjects_by_sem = {}
     for s in subs:
         subjects_by_sem.setdefault(str(s["semester"]), []).append(s)
-    # students list
     studs = list(STUDENTS.values())
-    st_name_map = {sid: USERS.get(USERS.get(session.get("user_email"), {}).get("email"), {}).get("name") for sid in []}  # placeholder
-    # real maps
-    st_name_map = {st["user_id"]: USERS.get(next((u for u in USERS if False), ""), {}).get("name", "") for st in studs}  # dummy, will be replaced properly
-    # build proper maps:
-    st_name_map = {}
-    st_email_map = {}
-    for st in studs:
-        # find user by id
-        user_obj = next((u for u in USERS.values() if u["id"] == st["user_id"]), None)
-        st_name_map[st["user_id"]] = user_obj["name"] if user_obj else ""
-        st_email_map[st["user_id"]] = user_obj["email"] if user_obj else ""
-    # marks list for display
+    # maps for display
+    st_name_map = {st["user_id"]: (next((u["name"] for u in USERS.values() if u["id"] == st["user_id"]), "")) for st in studs}
+    st_email_map = {st["user_id"]: (next((u["email"] for u in USERS.values() if u["id"] == st["user_id"]), "")) for st in studs}
+    # marks list
     marks_list = []
     for (sid, subid), m in MARKS.items():
-        st = next((s for s in studs if s["id"] == sid), None)
+        st = STUDENTS.get(sid)
         sub = SUBJECTS.get(subid)
         user_obj = next((u for u in USERS.values() if u["id"] == (st["user_id"] if st else None)), None)
         if st and sub:
@@ -611,42 +482,39 @@ def index():
         total_students=len(STUDENTS),
         total_marks=len(MARKS),
         total_att=len(ATT),
-        now=time.strftime("%Y-%m-%d %H:%M:%S"),
-        detail=None
+        now=time.strftime("%Y-%m-%d %H:%M:%S")
     )
-    return render_template_string(BASE_HTML, **ctx)
+    return render_template_string(PAGE, **ctx)
 
 # Signup (create student + user)
 @app.route("/signup", methods=["POST"])
 def signup():
-    name = request.form.get("name") or request.form.get("email")
-    email = request.form.get("email") or ""
-    phone = request.form.get("phone") or ""
+    name = (request.form.get("name") or "").strip()
+    email = (request.form.get("email") or "").strip().lower()
+    phone = (request.form.get("phone") or "").strip()
     password = request.form.get("password") or ""
-    roll = request.form.get("roll") or request.form.get("roll")
-    program = request.form.get("program") or ""
+    roll = (request.form.get("roll") or "").strip()
+    program = (request.form.get("program") or "").strip()
     if not email or not password or not roll:
         flash("Email, password and roll are required", "danger")
-        return redirect(url_for("index", _anchor="panel-students"))
+        return redirect(url_for("index") + "#students")
     if email in USERS:
         flash("Email already registered", "warning")
-        return redirect(url_for("index", _anchor="panel-students"))
-    h = hash_password(password)
-    uobj = {"id": uid(), "name": name, "email": email, "phone": phone, "role": "student", "password_hash": h}
-    USERS[email] = uobj
-    sobj = {"id": uid(), "user_id": uobj["id"], "roll": roll, "program": program}
-    STUDENTS[sobj["id"]] = sobj
+        return redirect(url_for("index") + "#students")
+    USERS[email] = {"id": uid(), "name": name or email.split("@")[0], "email": email, "phone": phone, "role": "student", "password_hash": salt_and_hash(password)}
+    sid = uid()
+    STUDENTS[sid] = {"id": sid, "user_id": USERS[email]["id"], "roll": roll, "program": program}
     session["user_email"] = email
     flash("Student created and logged in", "success")
     return redirect(url_for("index"))
 
-# Login (simple)
+# Login
 @app.route("/login", methods=["POST"])
 def login():
-    email = request.form.get("email") or ""
+    email = (request.form.get("email") or "").strip().lower()
     password = request.form.get("password") or ""
     user = USERS.get(email)
-    if not user or not verify_password(password, user["password_hash"]):
+    if not user or not verify_hash(password, user["password_hash"]):
         flash("Invalid credentials", "danger")
         return redirect(url_for("index"))
     session["user_email"] = email
@@ -665,91 +533,87 @@ def logout():
 def add_subject():
     code = (request.form.get("code") or "").strip()
     title = (request.form.get("title") or "").strip()
-    credits = int(request.form.get("credits") or 0)
-    semester = int(request.form.get("semester") or 0)
+    try:
+        credits = int(request.form.get("credits") or 0)
+        semester = int(request.form.get("semester") or 0)
+    except ValueError:
+        flash("Credits and semester must be integers", "danger")
+        return redirect(url_for("index") + "#subjects")
     if not code or not title or credits <= 0 or semester <= 0:
         flash("Invalid subject data", "danger")
-        return redirect(url_for("index", _anchor="panel-subjects"))
-    # ensure uniqueness by code
+        return redirect(url_for("index") + "#subjects")
     if any(s["code"].lower() == code.lower() for s in SUBJECTS.values()):
         flash("Subject code already exists", "warning")
-        return redirect(url_for("index", _anchor="panel-subjects"))
+        return redirect(url_for("index") + "#subjects")
     sid = uid()
     SUBJECTS[sid] = {"id": sid, "code": code, "title": title, "credits": credits, "semester": semester}
     flash("Subject added", "success")
-    return redirect(url_for("index", _anchor="panel-subjects"))
+    return redirect(url_for("index") + "#subjects")
 
 @app.route("/delete_subject/<sid>", methods=["POST"])
 @login_required(role="admin")
 def delete_subject(sid):
     if sid in SUBJECTS:
-        # remove marks/att for that subject
-        to_rm = [k for k in list(MARKS.keys()) if k[1] == sid]
-        for k in to_rm: MARKS.pop(k, None)
-        to_rm = [k for k in list(ATT.keys()) if k[1] == sid]
-        for k in to_rm: ATT.pop(k, None)
+        # remove related marks & attendance
+        for k in list(MARKS.keys()):
+            if k[1] == sid: MARKS.pop(k, None)
+        for k in list(ATT.keys()):
+            if k[1] == sid: ATT.pop(k, None)
         SUBJECTS.pop(sid, None)
         flash("Subject deleted", "info")
-    return redirect(url_for("index", _anchor="panel-subjects"))
+    return redirect(url_for("index") + "#subjects")
 
-# Enter or update marks
+# Enter/update marks
 @app.route("/enter_marks", methods=["POST"])
 @login_required()
 def enter_marks():
     student_id = request.form.get("student_id")
     subject_id = request.form.get("subject_id")
-    marks_val = request.form.get("marks")
     try:
-        marks_f = float(marks_val)
-    except Exception:
+        marks_f = float(request.form.get("marks") or "0")
+    except ValueError:
         flash("Invalid marks value", "danger")
-        return redirect(url_for("index", _anchor="panel-marks"))
-    if not student_id or not subject_id or subject_id not in SUBJECTS or student_id not in STUDENTS:
+        return redirect(url_for("index") + "#marks")
+    if student_id not in STUDENTS or subject_id not in SUBJECTS:
         flash("Invalid student or subject", "danger")
-        return redirect(url_for("index", _anchor="panel-marks"))
+        return redirect(url_for("index") + "#marks")
     key = (student_id, subject_id)
-    if key in MARKS:
-        MARKS[key] = marks_f
-        flash("Marks updated", "success")
-    else:
-        MARKS[key] = marks_f
-        flash("Marks saved", "success")
-    return redirect(url_for("index", _anchor="panel-marks"))
+    MARKS[key] = marks_f
+    flash("Marks saved/updated", "success")
+    return redirect(url_for("index") + "#marks")
 
-# Enter or update attendance
+# Enter/update attendance
 @app.route("/enter_attendance", methods=["POST"])
 @login_required()
 def enter_attendance():
     student_id = request.form.get("student_id")
     subject_id = request.form.get("subject_id")
-    present = request.form.get("present")
-    total = request.form.get("total")
     try:
-        pd = int(present); td = int(total)
-    except Exception:
+        pd = int(request.form.get("present") or "0")
+        td = int(request.form.get("total") or "0")
+    except ValueError:
         flash("Invalid attendance numbers", "danger")
-        return redirect(url_for("index", _anchor="panel-att"))
+        return redirect(url_for("index") + "#att")
     if pd < 0 or td <= 0 or pd > td:
         flash("Invalid attendance values", "danger")
-        return redirect(url_for("index", _anchor="panel-att"))
+        return redirect(url_for("index") + "#att")
     if student_id not in STUDENTS or subject_id not in SUBJECTS:
         flash("Invalid student or subject", "danger")
-        return redirect(url_for("index", _anchor="panel-att"))
+        return redirect(url_for("index") + "#att")
     key = (student_id, subject_id)
     ATT[key] = (pd, td)
     flash("Attendance saved", "success")
-    return redirect(url_for("index", _anchor="panel-att"))
+    return redirect(url_for("index") + "#att")
 
-# View student detail (dashboard-like)
+# View student detail
 @app.route("/student/<sid>")
 @login_required()
 def view_student(sid):
     st = STUDENTS.get(sid)
     if not st:
         flash("Student not found", "danger")
-        return redirect(url_for("index", _anchor="panel-students"))
+        return redirect(url_for("index") + "#students")
     user_obj = next((u for u in USERS.values() if u["id"] == st["user_id"]), {})
-    # build sem-wise subjects
     sems = {}
     sgpa_map = {}
     for s in SUBJECTS.values():
@@ -765,12 +629,16 @@ def view_student(sid):
     ctx = dict(
         user=USERS.get(session.get("user_email")),
         demo_output=safe_run_demo(),
-        subjects_by_sem={}, subjects=list(SUBJECTS.values()),
-        students=list(STUDENTS.values()), st_name_map={},
+        subjects_by_sem={},
+        subjects=list(SUBJECTS.values()),
+        students=list(STUDENTS.values()),
+        st_name_map={},
         st_email_map={},
         marks_list=[],
-        total_subjects=len(SUBJECTS), total_students=len(STUDENTS),
-        total_marks=len(MARKS), total_att=len(ATT),
+        total_subjects=len(SUBJECTS),
+        total_students=len(STUDENTS),
+        total_marks=len(MARKS),
+        total_att=len(ATT),
         now=time.strftime("%Y-%m-%d %H:%M:%S"),
         detail={
             "name": user_obj.get("name", ""),
@@ -783,7 +651,7 @@ def view_student(sid):
             "cgpa": ("{:.3f}".format(cg) if cg is not None else None)
         }
     )
-    return render_template_string(BASE_HTML, **ctx)
+    return render_template_string(PAGE, **ctx)
 
 # Delete student (admin)
 @app.route("/delete_student/<sid>", methods=["POST"])
@@ -791,23 +659,23 @@ def view_student(sid):
 def delete_student(sid):
     st = STUDENTS.pop(sid, None)
     if st:
-        # remove related marks and attendance
         for k in list(MARKS.keys()):
             if k[0] == sid: MARKS.pop(k, None)
         for k in list(ATT.keys()):
             if k[0] == sid: ATT.pop(k, None)
-        # optionally remove user (or keep)
+        # remove associated user
         user_id = st["user_id"]
         email_to_remove = None
         for email, u in list(USERS.items()):
             if u["id"] == user_id:
                 email_to_remove = email
                 break
-        if email_to_remove: USERS.pop(email_to_remove, None)
+        if email_to_remove:
+            USERS.pop(email_to_remove, None)
         flash("Student deleted", "info")
-    return redirect(url_for("index", _anchor="panel-students"))
+    return redirect(url_for("index") + "#students")
 
-# Compatibility: allow form-based login/signup via named endpoints
+# Compatibility endpoints
 @app.route("/do_login", methods=["POST"])
 def do_login():
     return login()
@@ -816,13 +684,7 @@ def do_login():
 def do_signup():
     return signup()
 
-# Simple route to run demo (redirect home which runs demo)
-@app.route("/demo")
-def demo():
-    return redirect(url_for("index"))
-
-# Start the app (bind to PORT if run directly)
+# Start server (bind to PORT when run directly)
 if __name__ == "__main__":
     ensure_default_admin()
     app.run(host="0.0.0.0", port=PORT, debug=False)
-
