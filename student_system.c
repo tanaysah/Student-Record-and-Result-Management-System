@@ -881,6 +881,39 @@ void create_sample_students_if_needed(void) {
     }
     save_students_csv(); save_marks_csv(); save_atts_csv();
 }
+int api_find_index_by_id(const char *sap) {
+    return student_index_by_sap(sap);
+}
+
+int api_admin_auth(const char *user, const char *pass) {
+    return (strcmp(user,"admin")==0 && strcmp(pass,"admin123")==0);
+}
+
+int api_add_student(Student s) {
+    if (student_count >= MAX_STUDENTS) return -1;
+    students[student_count++] = s;
+    save_students_csv();
+    return 0;
+}
+
+double api_calculate_update_cgpa(const char *sap) {
+    double cg = compute_cgpa_credit_weighted(sap);
+    save_students_csv();
+    return cg;
+}
+
+void save_data(void) {
+    save_students_csv();
+    save_marks_csv();
+    save_atts_csv();
+}
+
+void load_data(void) {
+    load_students_csv();
+    load_marks_csv();
+    load_atts_csv();
+}
+
 
 /* ---------- Main menu ---------- */
 void print_menu(void) {
@@ -966,5 +999,6 @@ int main(int argc, char **argv) {
     return 0;
   */
 }
+
 
 
