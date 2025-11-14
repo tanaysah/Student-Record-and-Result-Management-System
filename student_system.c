@@ -930,6 +930,7 @@ int main(int argc, char **argv) {
             case 5:
                 if (!admin_auth()) break;
                 admin_mark_attendance_single();
+                
                 break;
             case 6:
                 if (!admin_auth()) break;
