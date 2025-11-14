@@ -47,6 +47,9 @@
 #define MAX_TITLE 160
 #define MAX_CODE 32
 
+Student students[MAX_STUDENTS];
+int student_count = 0;
+
 /* ---------- Types ---------- */
 typedef struct {
     char sap[32];        /* SAP ID (we store as string) */
@@ -963,4 +966,5 @@ int main(int argc, char **argv) {
     return 0;
   */
 }
+
 
