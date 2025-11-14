@@ -902,7 +902,7 @@ void print_menu(void) {
     printf("0. Exit\n");
     printf("Enter choice: ");
 }
-
+/*
 int main(int argc, char **argv) {
     ensure_dirs();
     load_subjects_csv();
@@ -961,4 +961,6 @@ int main(int argc, char **argv) {
         }
     }
     return 0;
+  */
 }
+
