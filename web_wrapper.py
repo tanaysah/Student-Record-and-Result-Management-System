@@ -24,8 +24,14 @@ from flask import Flask, render_template_string, request, redirect, url_for, ses
 try:
     from passlib.hash import bcrypt
     HAS_PASSLIB = True
+    # disable bcrypt backend if it's broken
+    try:
+        bcrypt.verify  # access to ensure backend availability
+    except Exception:
+        HAS_PASSLIB = False
 except Exception:
     HAS_PASSLIB = False
+
 
 app = Flask(__name__)
 app.secret_key = os.environ.get("SECRET_KEY", str(uuid.uuid4()))
@@ -819,3 +825,4 @@ def demo():
 if __name__ == "__main__":
     ensure_default_admin()
     app.run(host="0.0.0.0", port=PORT, debug=False)
+
