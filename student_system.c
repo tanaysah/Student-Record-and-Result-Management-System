@@ -400,7 +400,8 @@ void add_marks_placeholder_for_student(const char *sap, int sem_limit) {
             if (marks_count < MAX_MARKS) {
                 MarkRec m; memset(&m,0,sizeof(m));
                 strncpy(m.sap, sap, sizeof(m.sap)-1);
-                strncpy(m.subid, subjects[i].id, sizeof(m.subid)-1);
+                snprintf(m.subid, sizeof(m.subid), "%s", subjects[i].id);
+
                 m.marks = -1.0;
                 marks[marks_count++] = m;
             }
@@ -499,7 +500,8 @@ void admin_enter_update_marks(void) {
     SubjectRec *sub = &subjects[idx-1];
     if (sub->semester > st->current_sem) { printf("Student not assigned this future semester subject.\n"); return; }
     printf("Enter marks (0-100): "); safe_getline(buf, sizeof(buf)); double mm = atof(buf);
-    if (mm < 0) mm = 0; if (mm > 100) mm = 100;
+    if (mm < 0) mm = 0;
+    if (mm > 100) mm = 100;
     int mi = mark_index(st->sap, sub->id);
     if (mi >= 0) {
         marks[mi].marks = mm;
@@ -998,7 +1000,6 @@ int main(int argc, char **argv) {
     return 0;
     }
   */
-
 
 
 
