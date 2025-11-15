@@ -12,7 +12,6 @@
   - Portable: works on Linux and Windows (MinGW)
   Author: Rewritten per user request
 */
-
 #define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
@@ -46,22 +45,18 @@
 #define MAX_PHONE 32
 #define MAX_TITLE 160
 #define MAX_CODE 32
-
-
-
-/* ---------- Types ---------- */
 typedef struct {
-    char sap[32];        /* SAP ID (we store as string) */
+    char sap[32];
     char roll[32];
     char name[MAX_NAME];
     char email[MAX_EMAIL];
     char phone[MAX_PHONE];
-    int year;            /* 1..4 */
-    int current_sem;     /* 1..8 */
+    int year;
+    int current_sem;    
 } Student;
 
 typedef struct {
-    char id[32];         /* subject unique id */
+    char id[32]; 
     char code[MAX_CODE];
     char title[MAX_TITLE];
     int credits;
@@ -1000,6 +995,7 @@ int main(int argc, char **argv) {
     return 0;
     }
   */
+
 
 
 
