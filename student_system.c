@@ -10,7 +10,6 @@
   - CGPA calculation (credit-weighted)
   - Generates printable report card files (text)
   - Portable: works on Linux and Windows (MinGW)
-  Author: Rewritten per user request
 */
 #define _GNU_SOURCE
 #include <stdio.h>
@@ -995,6 +994,7 @@ int main(int argc, char **argv) {
     return 0;
     }
   */
+
 
 
 
