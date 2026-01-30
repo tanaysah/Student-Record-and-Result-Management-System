@@ -3,8 +3,7 @@
   Student Record & Result Management System
   - Single-file C program
   - Menu-driven console app
-  - CSV persistence in data/
-  - Student self-registration s
+  - CSV persiste
 */
 #define _GNU_SOURCE
 #include <stdio.h>
@@ -989,6 +988,7 @@ int main(int argc, char **argv) {
     return 0;
     }
   */
+
 
 
 
