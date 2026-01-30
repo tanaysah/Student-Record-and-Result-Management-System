@@ -4,8 +4,7 @@
   - Single-file C program
   - Menu-driven console app
   - CSV persistence in data/
-  - Student self-registration supported
-  - Admin-managed marks/attendance
+  - Student self-registration s
 */
 #define _GNU_SOURCE
 #include <stdio.h>
@@ -990,6 +989,7 @@ int main(int argc, char **argv) {
     return 0;
     }
   */
+
 
 
 
