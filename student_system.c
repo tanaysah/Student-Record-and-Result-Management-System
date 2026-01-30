@@ -6,10 +6,6 @@
   - CSV persistence in data/
   - Student self-registration supported
   - Admin-managed marks/attendance
-  - SGPA calculation per semester (credit-weighted)
-
- 
-
 */
 #define _GNU_SOURCE
 #include <stdio.h>
@@ -994,6 +990,7 @@ int main(int argc, char **argv) {
     return 0;
     }
   */
+
 
 
 
