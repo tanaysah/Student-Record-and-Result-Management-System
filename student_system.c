@@ -7,7 +7,7 @@
   - Student self-registration supported
   - Admin-managed marks/attendance
   - SGPA calculation per semester (credit-weighted)
-  - CGPA calculation (credit-weighted)
+
  
 
 */
@@ -994,6 +994,7 @@ int main(int argc, char **argv) {
     return 0;
     }
   */
+
 
 
 
