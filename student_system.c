@@ -66,7 +66,6 @@ typedef struct {
     int total;
 } AttRec;
 
-/* ---------- In-memory storage ---------- */
 Student students[MAX_STUDENTS];
 int student_count = 0;
 
@@ -79,7 +78,6 @@ static int marks_count = 0;
 static AttRec atts[MAX_ATTS];
 static int atts_count = 0;
 
-/* ---------- Utility helpers ---------- */
 void ensure_dirs(void) {
     struct stat st;
     if (stat(DATA_DIR, &st) == -1) mkdirp(DATA_DIR);
@@ -985,6 +983,7 @@ int main(int argc, char **argv) {
     return 0;
     }
   */
+
 
 
 
