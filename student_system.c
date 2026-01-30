@@ -1,9 +1,6 @@
 /*
   student_system.c
   Student Record & Result Management System
-  - Single-file C program
-
-
 */
 #define _GNU_SOURCE
 #include <stdio.h>
@@ -988,6 +985,7 @@ int main(int argc, char **argv) {
     return 0;
     }
   */
+
 
 
 
